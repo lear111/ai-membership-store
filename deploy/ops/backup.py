@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+from contextlib import nullcontext
 import datetime as dt
 import hashlib
 import ipaddress
@@ -11,6 +12,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 from urllib.parse import urlsplit
 from uuid import uuid4
@@ -20,6 +22,7 @@ from common import (
     Failure, command, configuration, docker, inspect, lock, log, private_file,
     read_json, utc, write_json,
 )
+from windows_backup import WindowsTunnel, local_windows_repository, verified_operations
 
 
 PROJECT = "ai-membership-store-production"
@@ -87,24 +90,27 @@ def rows(mysql, sql):
 
 
 def release_migrations(directory):
-    migrations = {}
     try:
-        for entry in directory.iterdir():
-            if not entry.is_dir():
-                continue
-            sql = (entry / "migration.sql").read_bytes()
-            lf = sql.replace(b"\r\n", b"\n")
-            # Match T23.1 bootstrap: exact, LF and CRLF SHA-256.
-            migrations[entry.name] = {
-                hashlib.sha256(text).hexdigest() for text in (sql, lf, lf.replace(b"\n", b"\r\n"))
-            }
+        return migration_checksums({
+            entry.name: (entry / "migration.sql").read_bytes()
+            for entry in directory.iterdir() if entry.is_dir()
+        })
     except OSError:
         raise Failure("OPERATIONS_MIGRATIONS_MISSING") from None
+
+
+def migration_checksums(scripts):
     # A historical restore uses the operations archive for that backup's release.
     t25 = "20261124000000_customer_invitation_registration"
-    expected_count = 15 if t25 in migrations else 14
-    if len(migrations) != expected_count:
+    if len(scripts) != (15 if t25 in scripts else 14):
         raise Failure("OPERATIONS_MIGRATIONS_MISSING")
+    migrations = {}
+    for name, sql in scripts.items():
+        lf = sql.replace(b"\r\n", b"\n")
+        # Match T23.1 bootstrap: exact, LF and CRLF SHA-256.
+        migrations[name] = {
+            hashlib.sha256(text).hexdigest() for text in (sql, lf, lf.replace(b"\n", b"\r\n"))
+        }
     return migrations
 
 
@@ -163,7 +169,7 @@ def assert_off_host(host):
 
 
 class Repository:
-    def __init__(self, fixture):
+    def __init__(self, fixture, *, tunnel=None, staging=None, local_repository=None):
         location = os.environ.get("RESTIC_REPOSITORY", "")
         password = os.environ.get("RESTIC_PASSWORD_FILE", "")
         if not private_file(password):
@@ -177,7 +183,16 @@ class Repository:
             "AWS_EC2_METADATA_DISABLED": "true",
         }
         self.args = [str(binary), "--no-cache"]
-        if fixture is not None:
+        self.tunnel = tunnel
+        if tunnel is not None:
+            self.set_explicit_location(location, tunnel.location)
+            self.sftp, transport = tunnel.configure(staging, self.env)
+            self.args += ["-o", transport]
+        elif local_repository is not None:
+            self.set_explicit_location(location, local_windows_repository(local_repository))
+            # Reading a saved repository must not leave lock files on Windows.
+            self.args += ["--no-lock"]
+        elif fixture is not None:
             if location != str(fixture / "repo"):
                 raise Failure("FIXTURE_REPOSITORY_REQUIRED")
             # Fixture-only command shims are used for failure injection.
@@ -212,7 +227,21 @@ class Repository:
         if not re.match(rb"^restic 0\.20\.0(?:\s|$)", self.call("version")):
             raise Failure("RESTIC_VERSION")
 
+    def set_explicit_location(self, inherited, selected):
+        if inherited and inherited != selected:
+            raise Failure("WINDOWS_REPOSITORY_ENV_MISMATCH")
+        self.env["RESTIC_REPOSITORY"] = selected
+
+    def initialize_windows(self):
+        self.tunnel.verify_listener()
+        # mkdir fails if the dedicated directory already exists; never reuse an old run.
+        command(self.sftp, "WINDOWS_REPOSITORY_NOT_NEW",
+                input=f"mkdir {self.tunnel.directory}\n".encode("ascii"), env=self.env)
+        self.call("init", error="REPOSITORY_INIT_FAILED")
+
     def call(self, *args, error="RESTIC_OPERATION", timeout=3600):
+        if self.tunnel is not None and args != ("version",):
+            self.tunnel.verify_listener()
         return command([*self.args, *args], error, env=self.env, timeout=timeout)
 
     def snapshot(self, run, part, *args):
@@ -290,8 +319,35 @@ def operations_root(fixture):
     return fixture / "app" if fixture else HERE.parents[1]
 
 
-def backup(repo, settings, state, fixture):
-    status_path = state / "backup.json"
+def matching_runtime(archive):
+    current = Path("/opt/ai-membership-store/current")
+    runtime = read_json(current / "release.json", {})
+    if (runtime.get("kind"), runtime.get("gitSha")) != ("runtime", archive.release_sha):
+        raise Failure("OPERATIONS_RELEASE_MISMATCH")
+    pid = command(["systemctl", "show", "ai-membership-store.service", "--property=MainPID", "--value"],
+                  "RUNNING_RELEASE_IDENTITY").decode().strip()
+    if (not re.fullmatch(r"[1-9][0-9]*", pid)
+            or Path("/proc", pid, "cwd").resolve() != current.resolve(strict=True) / "backend"):
+        raise Failure("RUNNING_RELEASE_IDENTITY")
+    return runtime
+
+
+def windows_release_evidence(archive):
+    driver = {}
+    for name in ("backup.py", "common.py", "windows_backup.py"):
+        with (HERE / name).open("rb") as source:
+            driver[name] = hashlib.file_digest(source, "sha256").hexdigest()
+    return {"operationsArchiveSha256": archive.archive_sha256,
+            "operationsReleaseSha": archive.release_sha, "driverFileSha256": driver}
+
+
+def table_counts(mysql):
+    statements = [f"SELECT JSON_ARRAY('{table}',(SELECT COUNT(*) FROM `{table}`))" for table in sorted(TABLES)]
+    return dict(rows(mysql, " UNION ALL ".join(statements)))
+
+
+def backup(repo, settings, state, fixture, *, archive=None):
+    status_path = state / ("windows-backup.json" if archive is not None else "backup.json")
     old = read_json(status_path, {})
     started = time.monotonic()
     started_at = utc()
@@ -302,12 +358,18 @@ def backup(repo, settings, state, fixture):
         if min(shutil.disk_usage(path).free for path in (state, root.parent)) < settings.get("minFreeBytes", 268435456):
             raise Failure("LOCAL_SPACE_LOW")
         paths = image_directories(root)
-        sha = release_sha(fixture)
-        operations = operations_root(fixture)
-        operations_manifest = read_json(operations / "release.json", {})
-        if (operations_manifest.get("kind"), operations_manifest.get("gitSha")) != ("operations", sha):
-            raise Failure("OPERATIONS_RELEASE_MISMATCH")
-        expected = release_migrations(operations / "backend/prisma/migrations")
+        if archive is not None:
+            runtime = matching_runtime(archive)
+            sha = archive.release_sha
+            expected = migration_checksums(archive.migrations)
+            evidence = windows_release_evidence(archive)
+        else:
+            sha = release_sha(fixture)
+            operations = operations_root(fixture)
+            operations_manifest = read_json(operations / "release.json", {})
+            if (operations_manifest.get("kind"), operations_manifest.get("gitSha")) != ("operations", sha):
+                raise Failure("OPERATIONS_RELEASE_MISMATCH")
+            expected = release_migrations(operations / "backend/prisma/migrations")
         if fixture:
             project = settings.get("fixtureProject", "")
             if not FIXTURE_PROJECT.fullmatch(project):
@@ -327,13 +389,20 @@ def backup(repo, settings, state, fixture):
         mysql = [*client, "mysql", *options, "--batch", "--raw", "--skip-column-names", DATABASE]
         before = inventory(mysql, expected)
         check_image_references(mysql, paths, "BACKUP_IMAGE_REFERENCE")
+        if archive is not None:
+            counts = table_counts(mysql)
+            repo.initialize_windows()
         database_started_at = utc()
         database = repo.snapshot(run, "database", "--stdin-from-command", "--stdin-filename", "database.sql",
                                  "--", *client, "mysqldump", *options, *DUMP)
         images = repo.snapshot(run, "images", "--one-file-system", "--", *map(str, paths))
-        if (inventory(mysql, expected) != before or release_sha(fixture) != sha
-                or read_json(operations / "release.json", {}) != operations_manifest
-                or release_migrations(operations / "backend/prisma/migrations") != expected):
+        if inventory(mysql, expected) != before:
+            raise Failure("DATABASE_OR_RELEASE_CHANGED")
+        if archive is not None:
+            if matching_runtime(archive) != runtime or table_counts(mysql) != counts:
+                raise Failure("DATABASE_OR_RELEASE_CHANGED")
+        elif (release_sha(fixture) != sha or read_json(operations / "release.json", {}) != operations_manifest
+              or release_migrations(operations / "backend/prisma/migrations") != expected):
             raise Failure("DATABASE_OR_RELEASE_CHANGED")
         completed = utc()
         manifest = {
@@ -341,8 +410,10 @@ def backup(repo, settings, state, fixture):
             "completedAt": completed, "releaseSha": sha, "inventory": before,
             "databaseSnapshot": database, "imagesSnapshot": images, "imagePaths": list(map(str, paths)),
         }
+        if archive is not None:
+            manifest["windowsBackup"] = {**evidence, "tableCounts": counts,
+                                         "hostKeyFingerprint": repo.tunnel.fingerprint}
         # A private, small metadata file only. The SQL stream never lands here.
-        import tempfile
         with tempfile.TemporaryDirectory(dir=state) as staging:
             file = Path(staging) / "manifest.json"
             write_json(file, manifest)
@@ -351,7 +422,8 @@ def backup(repo, settings, state, fixture):
         write_json(status_path, {"lastSuccessAt": completed, "lastAttemptAt": completed,
                                  "run": run, "manifest": marker, "result": "success"})
         log("backup_completed", run=run, tables=len(before["tables"]), migrations=len(before["migrations"]),
-            triggers=before["triggerCount"], durationSeconds=round(time.monotonic() - started, 3))
+            triggers=before["triggerCount"], durationSeconds=round(time.monotonic() - started, 3),
+            **(evidence if archive is not None else {}))
     except (Failure, OSError, ValueError, TypeError, KeyError) as exc:
         reason = str(exc) if isinstance(exc, Failure) else "BACKUP_INTERNAL"
         write_json(status_path, {**old, "result": "failed", "lastAttemptAt": utc(), "errorCode": reason})
@@ -412,7 +484,7 @@ def verify_definer_privileges(mysql, definer_tables):
             raise Failure("RESTORE_DEFINER_PRIVILEGES")
 
 
-def restore(repo, run, project, output, migrations_directory):
+def restore(repo, run, project, output, migrations_directory=None, *, archive=None):
     if not RUN.fullmatch(run) or not RESTORE_PROJECT.fullmatch(project):
         raise Failure("RESTORE_TARGET_ARGUMENT")
     if (not output.is_absolute() or output.parent.resolve(strict=True) != output.parent
@@ -429,7 +501,16 @@ def restore(repo, run, project, output, migrations_directory):
         raise Failure("RESTORE_TARGET_NONEMPTY")
     meta = load_manifest(repo, run, groups(repo).get(run, {}))
     recorded = meta["inventory"]
-    expected = release_migrations(migrations_directory)
+    if archive is None:
+        expected = release_migrations(migrations_directory)
+    else:
+        details = meta.get("windowsBackup", {})
+        counts = details.get("tableCounts", {})
+        if ((meta.get("releaseSha"), details.get("operationsReleaseSha"), details.get("operationsArchiveSha256"))
+                != (archive.release_sha, archive.release_sha, archive.archive_sha256)
+                or set(counts) != TABLES or any(type(value) is not int or value < 0 for value in counts.values())):
+            raise Failure("WINDOWS_RESTORE_MANIFEST")
+        expected = migration_checksums(archive.migrations)
     verify_migrations(recorded["migrations"], expected)
     if set(recorded["tables"]) != TABLES:
         raise Failure("DATABASE_SCHEMA_INCOMPLETE")
@@ -438,6 +519,8 @@ def restore(repo, run, project, output, migrations_directory):
         raise Failure("RESTORE_DEFINERS_MISSING")
     if "triggerDefinerTables" in recorded:
         verify_definer_privileges(mysql, recorded["triggerDefinerTables"])
+    if archive is not None:
+        repo.call("check", "--read-data", error="WINDOWS_REPOSITORY_VERIFY")
     started = time.monotonic()
     output.mkdir(mode=0o700)
     repo.call("restore", meta["imagesSnapshot"], "--target", str(output), "--verify", error="RESTORE_IMAGES")
@@ -469,6 +552,8 @@ def restore(repo, run, project, output, migrations_directory):
         verify_definer_privileges(mysql, restored.pop("triggerDefinerTables"))
     if restored != recorded:
         raise Failure("RESTORE_SCHEMA_MISMATCH")
+    if archive is not None and table_counts(mysql) != counts:
+        raise Failure("RESTORE_TABLE_COUNTS")
     check_image_references(mysql, paths, "RESTORE_IMAGE_REFERENCE")
     log("restore_completed", run=run, tables=len(meta["inventory"]["tables"]),
         migrations=len(meta["inventory"]["migrations"]), triggers=meta["inventory"]["triggerCount"],
@@ -478,13 +563,30 @@ def restore(repo, run, project, output, migrations_directory):
 def run_tool():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=Path, default=CONFIG)
-    parser.add_argument("--fixture", type=Path, help="Disposable synthetic integration fixture only")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--fixture", type=Path, help="Disposable synthetic integration fixture only")
+    mode.add_argument("--windows-tunnel-profile", type=Path,
+                      help="One-off backup only. Root:root 0600 JSON with port, repository and independently pinned hostKey;"
+                           " repository is a new membership-<32 hex> directory, and the sibling windows-tunnel-key"
+                           " file is the dedicated client identity.")
+    mode.add_argument("--windows-local-repository", type=Path,
+                      help="Isolated restore only (Linux/WSL). Absolute path of the saved Windows encrypted repository.")
+    parser.add_argument("--operations-archive", type=Path,
+                        help="Original operations .tar.gz for the runtime being backed up or restored")
+    parser.add_argument("--operations-sha256", help="Independently verified SHA-256 of the original operations archive")
     parser.add_argument("operation", choices=("init", "backup", "check", "check-data", "plan-retention",
                                                 "apply-retention", "plan-prune", "prune", "inspect", "restore"))
     parser.add_argument("--run", default="")
     parser.add_argument("--project", default="")
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
+    windows = args.windows_tunnel_profile or args.windows_local_repository
+    if ((args.windows_tunnel_profile and args.operation != "backup")
+            or (args.windows_local_repository and args.operation != "restore")):
+        raise Failure("WINDOWS_OPERATION_FORBIDDEN")
+    if bool(windows) != bool(args.operations_archive and args.operations_sha256) or (
+            not windows and (args.operations_archive or args.operations_sha256)):
+        raise Failure("OPERATIONS_ARCHIVE_ARGUMENT")
     os.umask(0o077)
     if os.geteuid() != 0 or any(os.environ.get(name) for name in ("DOCKER_HOST", "DOCKER_CONTEXT")):
         raise Failure("LOCAL_ROOT_OPERATOR_REQUIRED")
@@ -497,20 +599,23 @@ def run_tool():
                     or fixture.resolve(strict=True) != fixture or args.config != fixture / "ops.json"):
         raise Failure("FIXTURE_PATH_REQUIRED")
     state = fixture / "state" if fixture else STATE
-    settings = configuration(args.config)
-    with lock(state, "repository"):
-        repo = Repository(fixture)
+    settings = {} if args.windows_local_repository else configuration(args.config)
+    archive = verified_operations(args.operations_archive, args.operations_sha256) if windows else None
+    tunnel = WindowsTunnel.from_profile(args.windows_tunnel_profile) if args.windows_tunnel_profile else None
+    with lock(state, "repository"), (tempfile.TemporaryDirectory(dir=state) if tunnel else nullcontext()) as staging:
+        repo = Repository(fixture, tunnel=tunnel, staging=Path(staging) if staging else None,
+                          local_repository=args.windows_local_repository)
         match args.operation:
             case "init":
                 repo.call("init", error="REPOSITORY_INIT_FAILED")
                 log("repository_initialized")
             case "backup":
-                backup(repo, settings, state, fixture)
+                backup(repo, settings, state, fixture, archive=archive)
             case "restore":
                 if args.output is None:
                     raise Failure("RESTORE_OUTPUT_REQUIRED")
                 restore(repo, args.run, args.project, args.output,
-                        operations_root(fixture) / "backend/prisma/migrations")
+                        operations_root(fixture) / "backend/prisma/migrations", archive=archive)
             case "inspect":
                 log("backup_manifest", manifest=load_manifest(repo, args.run, groups(repo).get(args.run, {})))
             case _:

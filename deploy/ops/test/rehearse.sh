@@ -7,6 +7,7 @@ umask 077
 restic=$(realpath -e "$1")
 archive=$(realpath -e "$2")
 checkout=$(realpath -e "$3")
+driver=$(realpath -e "$(dirname -- "$0")/..")
 [[ -f $checkout/backend/dist/server.js && -z ${DOCKER_CONTEXT:-} && -z ${DOCKER_HOST:-} ]]
 endpoint=$(docker context inspect --format '{{.Endpoints.docker.Host}}')
 [[ $endpoint == unix:///var/run/docker.sock ]]
@@ -41,7 +42,7 @@ tar -xzf "$archive" -C "$root/app"
 cmp <(tr -d '\r' <"$root/app/package-lock.json") <(tr -d '\r' <"$checkout/package-lock.json")
 diff -qr --strip-trailing-cr "$root/app/backend/prisma/migrations" "$checkout/backend/prisma/migrations"
 cp -a "$checkout/backend/dist" "$root/app/backend/"
-cp "$checkout/deploy/ops/test/fixture.mjs" "$root/app/backend/fixture.mjs"
+cp "$driver/test/fixture.mjs" "$root/app/backend/fixture.mjs"
 root_password=$(openssl rand -hex 28)
 migrate_password=$(openssl rand -hex 28)
 app_password=$(openssl rand -hex 28)
@@ -57,7 +58,9 @@ printf '{"gitSha":"%s"}\n' "$release" >"$root/release.json"
 printf '{"fixtureProject":"%s","keepHourly":0,"keepDaily":0,"keepWeekly":0,"keepMonthly":0}\n' \
   "$source" >"$root/ops.json"
 cp "$root/ops.json" "$root/ops-valid"
-printf '{"kind":"operations","gitSha":"%s"}\n' "$release" >"$root/app/release.json"
+if [[ -z ${T273_WINDOWS_INCOMING:-} ]]; then
+  printf '{"kind":"operations","gitSha":"%s"}\n' "$release" >"$root/app/release.json"
+fi
 cat >"$root/source.compose.yaml" <<YAML
 services:
   mysql:
@@ -126,7 +129,7 @@ fixture_api() {
     -w /work/backend ai-membership-store-t232-builder:local node --env-file=/fixture.env "$@"
 }
 operate() {
-  python3 -B "$checkout/deploy/ops/backup.py" --config "$root/ops.json" --fixture "$root" "$@"
+  python3 -B "$driver/backup.py" --config "$root/ops.json" --fixture "$root" "$@"
 }
 expected_failure() {
   local error=$1
@@ -219,6 +222,21 @@ print(next(checksum for data in variants if (checksum := hashlib.sha256(data).he
 sql "$source_id" -e "UPDATE _prisma_migrations SET checksum='$alternate_checksum' WHERE migration_name='$history'"
 operate backup
 run1=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["run"])' "$root/state/backup.json")
+if [[ -n ${T273_WINDOWS_INCOMING:-} ]]; then
+  python3 -B "$driver/test/windows_rehearsal.py" "$root" "$archive" \
+    "$T273_RUNTIME_MANIFEST" "$T273_WINDOWS_INCOMING"
+  mapfile -t windows < <(python3 -c '
+import json, sys
+data = json.load(open(sys.argv[1]))
+for field in ("repository", "run", "digest"):
+    print(data[field])
+' "$root/windows-restore.json")
+  [[ ${#windows[@]} == 3 ]]
+  if grep -aR -q T233_FIXTURE_PRIVATE_MARKER "${windows[0]}"; then
+    echo 'Synthetic plaintext unexpectedly found in Windows repository.' >&2
+    exit 1
+  fi
+fi
 restore_images=$root/$target-images
 "${target_compose[@]}" up -d mysql
 wait_db "$target_id"
@@ -240,7 +258,13 @@ expected_failure RESTORE_DEFINER_PRIVILEGES operate restore --run "$run1" --proj
 sql "$target_id" <<'SQL'
 GRANT SELECT ON `membership\_production`.* TO 'fixture_migrate'@'127.0.0.1';
 SQL
-operate restore --run "$run1" --project "$target" --output "$restore_images"
+if [[ -n ${T273_WINDOWS_INCOMING:-} ]]; then
+  env -u RESTIC_REPOSITORY python3 -B "$driver/backup.py" restore \
+    --windows-local-repository "${windows[0]}" --operations-archive "$archive" \
+    --operations-sha256 "${windows[2]}" --run "${windows[1]}" --project "$target" --output "$restore_images"
+else
+  operate restore --run "$run1" --project "$target" --output "$restore_images"
+fi
 expected_failure RESTORE_TARGET_NONEMPTY operate restore --run "$run1" --project "$target" --output "$root/$target-second"
 [[ ! -e $root/$target-second ]]
 counts() {
