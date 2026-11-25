@@ -116,6 +116,7 @@ These are implementation defaults, not irreversible decisions. Confirm any chang
 34. [docs/33-production-backup-and-monitoring.md](docs/33-production-backup-and-monitoring.md) — T23.3 paired backups, restore, private logs and monitoring.
 35. [docs/34-customer-claim-registration.md](docs/34-customer-claim-registration.md) — T25 merged implementation: label-only customer records and invitation-based registration; production migration/release remain pending.
 36. [docs/35-product-form-long-text.md](docs/35-product-form-long-text.md) — T26 merged implementation: 10,000-character textarea and bounded UTF-8 payload limits; no database migration.
+37. [docs/36-t27-batch-release.md](docs/36-t27-batch-release.md) — T27 batch release of T25/T26 and one-off Windows backup readiness.
 
 For production, use the [runtime example](.env.production.example), [clean installation guide](docs/31-production-clean-install.md) and [infrastructure runbook](docs/32-production-infrastructure.md). The production API, migrator and first-ADMIN command use separate credential contexts. Provision the clean database and bootstrap the owner before opening public registration in the approved launch window.
 
