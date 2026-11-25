@@ -1,4 +1,11 @@
 import { z } from 'zod'
+import {
+  FORM_TEXT_MAX_LENGTH,
+  formDataSizeMessage,
+  jsonUtf8Bytes,
+  MAX_FORM_DATA_BYTES,
+  textareaValue,
+} from './form-limits.ts'
 import { productFormSchema, type ProductFormSchema } from './product-form.ts'
 
 export type FormData = Record<string, string | number | string[]>
@@ -9,11 +16,13 @@ export function formDataSchema(input: ProductFormSchema) {
     let value: z.ZodType
     switch (field.type) {
       case 'text':
+        value = z.string().max(FORM_TEXT_MAX_LENGTH.text)
+        break
       case 'textarea':
-        value = z.string().max(500)
+        value = textareaValue
         break
       case 'email':
-        value = z.email().max(254)
+        value = z.email().max(FORM_TEXT_MAX_LENGTH.email)
         break
       case 'number':
         value = z
@@ -64,7 +73,8 @@ export function formDataSchema(input: ProductFormSchema) {
   return z
     .strictObject(fields)
     .refine(
-      (data) => new TextEncoder().encode(JSON.stringify(data)).length <= 8192,
+      (data) => jsonUtf8Bytes(data) <= MAX_FORM_DATA_BYTES,
+      formDataSizeMessage,
     )
 }
 

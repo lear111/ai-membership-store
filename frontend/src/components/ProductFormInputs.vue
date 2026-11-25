@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { FORM_TEXT_MAX_LENGTH } from '../../../backend/src/contracts/form-limits'
 import type { ProductFormSchema } from '../api/products'
 import type { FormData } from '../api/subscriptions'
 defineProps<{
@@ -97,7 +98,11 @@ function update(
         "
         :disabled="disabled"
         :aria-label="'服务信息 ' + field.label"
-        :maxlength="field.type === 'email' ? 254 : 500"
+        :maxlength="
+          field.type === 'number' || field.type === 'date'
+            ? undefined
+            : FORM_TEXT_MAX_LENGTH[field.type]
+        "
         :step="field.type === 'number' ? 'any' : undefined"
         @update:model-value="
           (value: string) =>

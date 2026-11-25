@@ -72,3 +72,39 @@ test('business routes are not exposed by this scaffold', async () => {
     }
   }
 })
+
+test('JSON transport accepts exactly 128 KiB and rejects one extra UTF-8 byte', async () => {
+  const value = '中🙂'.repeat(18_000)
+  const initial = JSON.stringify({ payload: value })
+  const padding = 131_072 - Buffer.byteLength(initial)
+  for (const [extra, status, code] of [
+    [0, 404, 'NOT_FOUND'],
+    [1, 413, 'PAYLOAD_TOO_LARGE'],
+  ] as const) {
+    const body = JSON.stringify({
+      payload: value + 'x'.repeat(padding + extra),
+    })
+    assert.equal(Buffer.byteLength(body), 131_072 + extra)
+    const response = await fetch(baseUrl + '/api/v1/unused', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body,
+    })
+    assert.equal(response.status, status)
+    assert.equal(response.headers.get('cache-control'), 'no-store')
+    const result = await response.json()
+    assert.equal(result.error.code, code)
+    assert.deepEqual(Object.keys(result.error).sort(), [
+      'code',
+      'message',
+      'requestId',
+    ])
+  }
+  const strict = await fetch(baseUrl + '/api/v1/unused', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: '"scalar"',
+  })
+  assert.equal(strict.status, 400)
+  assert.equal((await strict.json()).error.code, 'INVALID_INPUT')
+})

@@ -10,6 +10,14 @@ import {
   editProduct,
   completeProduct,
 } from '../src/modules/products/schemas.ts'
+import { formDataSchema } from '../src/contracts/form-data.ts'
+import {
+  formDataAtLimit,
+  formSchemaAtLimit,
+  jsonBytes,
+  longTextarea,
+  longTextFields,
+} from './long-text-fixture.ts'
 import { editSettings } from '../src/modules/settings/service.ts'
 
 const base = { label: '联系信息', required: false, hint: '仅限非敏感信息' }
@@ -102,7 +110,7 @@ test('choice options and defaults must be unique, bounded and type-correct', () 
   ])
     assert.equal(productFormSchema.safeParse(schema([field])).success, false)
 })
-test('defaults reject invalid emails, calendar dates, nonnumeric numbers and oversized schema', () => {
+test('defaults reject invalid emails, calendar dates, nonnumeric numbers', () => {
   for (const field of [
     { ...allFields[1], defaultValue: 'invalid' },
     { ...allFields[6], defaultValue: '1+1' },
@@ -112,18 +120,6 @@ test('defaults reject invalid emails, calendar dates, nonnumeric numbers and ove
     { ...allFields[7], defaultValue: 'new Date()' },
   ])
     assert.equal(productFormSchema.safeParse(schema([field])).success, false)
-  assert.equal(
-    productFormSchema.safeParse(
-      schema(
-        Array.from({ length: 20 }, (_, i) => ({
-          ...allFields[0],
-          id: 'f_' + i,
-          defaultValue: '中'.repeat(500),
-        })),
-      ),
-    ).success,
-    false,
-  )
   // Markup is inert text: renderers must interpolate, never v-html/eval it.
   assert.equal(
     productFormSchema.parse(
@@ -132,6 +128,84 @@ test('defaults reject invalid emails, calendar dates, nonnumeric numbers and ove
     '<b>literal</b>',
   )
 })
+test('textarea defaults and submitted values count UTF-16 units consistently', () => {
+  const field = longTextFields[0]!
+  const input = formDataSchema(productFormSchema.parse(schema([field])))
+  for (const value of [
+    'a'.repeat(10_000),
+    '中'.repeat(10_000),
+    '🙂'.repeat(5_000),
+    longTextarea,
+  ]) {
+    assert.equal(value.length, 10_000)
+    assert.equal(
+      productFormSchema.parse(schema([{ ...field, defaultValue: value }]))
+        .fields[0]!.defaultValue,
+      value,
+    )
+    assert.equal(input.parse({ note: value }).note, value)
+    assert.equal(
+      productFormSchema.safeParse(
+        schema([{ ...field, defaultValue: value + 'x' }]),
+      ).success,
+      false,
+    )
+    assert.equal(input.safeParse({ note: value + 'x' }).success, false)
+  }
+})
+
+test('single-line and email defaults and answers retain their own length limits', () => {
+  const emailDomain =
+    'b'.repeat(63) + '.' + 'c'.repeat(63) + '.' + 'd'.repeat(61)
+  for (const [type, value, tooLong] of [
+    ['text', '中'.repeat(500), '中'.repeat(501)],
+    [
+      'email',
+      'a'.repeat(64) + '@' + emailDomain,
+      'a'.repeat(64) + '@' + emailDomain + 'd',
+    ],
+  ]) {
+    const field = { ...base, id: 'field', type }
+    const config = productFormSchema.parse(
+      schema([{ ...field, defaultValue: value }]),
+    )
+    assert.equal(formDataSchema(config).parse({ field: value }).field, value)
+    assert.equal(
+      productFormSchema.safeParse(schema([{ ...field, defaultValue: tooLong }]))
+        .success,
+      false,
+    )
+    assert.equal(
+      formDataSchema(config).safeParse({ field: tooLong }).success,
+      false,
+    )
+  }
+})
+
+test('schema and form data independently accept exactly 64 KiB of serialized UTF-8', () => {
+  const configuration = formSchemaAtLimit()
+  assert.equal(jsonBytes(configuration), 65_536)
+  assert.deepEqual(productFormSchema.parse(configuration), configuration)
+  configuration.fields[2]!.defaultValue += 'x'
+  assert.equal(jsonBytes(configuration), 65_537)
+  assert.throws(
+    () => productFormSchema.parse(configuration),
+    /表单配置不能超过 64 KiB/,
+  )
+
+  const data = formDataAtLimit()
+  const form = formDataSchema(productFormSchema.parse(schema(longTextFields)))
+  assert.equal(jsonBytes(data), 65_536)
+  assert.deepEqual(form.parse(data), data)
+  data.extra += 'x'
+  assert.equal(jsonBytes(data), 65_537)
+  assert.throws(() => form.parse(data), /填写信息不能超过 64 KiB/)
+  assert.throws(
+    () => form.parse({ ...data, unknown: 'no' }),
+    /unrecognized_keys/,
+  )
+})
+
 test('product requests validate integer fen, type constraints, unknown properties and defaults', () => {
   const valid = {
     name: '服务',

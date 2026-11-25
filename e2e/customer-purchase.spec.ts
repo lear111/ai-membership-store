@@ -15,6 +15,11 @@ import {
   integrationEnvironment,
 } from '../backend/test/integration/support.ts'
 
+import {
+  formDataAtLimit,
+  longTextFields,
+} from '../backend/test/long-text-fixture.ts'
+import { pasteAtTextareaLimit } from './paste-textarea.ts'
 const env = integrationEnvironment()
 const db = createDatabase(env.DATABASE_URL)
 const fixturePassword = 'FictionalPurchaseFixture456!'
@@ -953,4 +958,39 @@ test('detail links use own-order API authorization and stay in sync with browser
   await expect(detail(page)).toContainText(own.orderNo)
   await detail(page).getByRole('button', { name: 'Close this dialog' }).click()
   await expect(page).toHaveURL('/orders?keep=1')
+})
+
+test('checkout pastes 10,000 characters and reports the UTF-8 aggregate error before accepting the exact boundary', async ({
+  page,
+  context,
+}) => {
+  const formSchema = { version: 1 as const, fields: longTextFields }
+  const [item, user] = await Promise.all([product({ formSchema }), customer()])
+  await signInSession(context, user.id)
+  await page.goto('/purchase/' + item.slug)
+  const data = formDataAtLimit()
+  await pasteAtTextareaLimit(page, input(page, 'note'), data.note)
+  await input(page, 'context').fill(data.context)
+  await input(page, 'extra').fill(data.extra + 'x')
+  await check(page).click()
+  await expect(page.getByRole('alert')).toContainText('填写信息不能超过 64 KiB')
+  await expect(confirmOrder(page)).toHaveCount(0)
+  await input(page, 'extra').fill(data.extra)
+  await check(page).click()
+  await expect(confirmOrder(page)).toBeVisible()
+  await expectNoOverflow(page)
+  const [response] = await Promise.all([
+    page.waitForResponse(
+      (r) =>
+        new URL(r.url()).pathname === ordersApi &&
+        r.request().method() === 'POST',
+    ),
+    confirmOrder(page).click(),
+  ])
+  expect(response.status()).toBe(201)
+  const { order } = await response.json()
+  await expectCreatedDetail(page, order)
+  expect(order.formData).toEqual(data)
+  const stored = await db.order.findUniqueOrThrow({ where: { id: order.id } })
+  expect(stored.formData).toEqual(data)
 })

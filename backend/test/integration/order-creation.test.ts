@@ -6,6 +6,11 @@ import crypto from 'node:crypto'
 import { execFileSync } from 'node:child_process'
 import type { Server } from 'node:http'
 import { isDeepStrictEqual } from 'node:util'
+import {
+  formDataAtLimit,
+  formSchemaAtLimit,
+  jsonBytes,
+} from '../long-text-fixture.ts'
 import { createApp } from '../../src/app.ts'
 import { createDatabase, checkDatabase } from '../../src/db/client.ts'
 import type {
@@ -1244,4 +1249,62 @@ test('MySQL independently rejects invalid NOT_REQUIRED states and accepts strict
   assert.equal(read.status, 200)
   assert.equal(read.body.order.paymentStatus, 'NOT_REQUIRED')
   assert.equal(read.body.order.remainingSeconds, 0)
+})
+
+test('customer and admin can submit and replay 64 KiB forms without losing frozen data', async () => {
+  const formSchema = formSchemaAtLimit()
+  const p = await product({ formSchema })
+  const formData = formDataAtLimit()
+  assert.equal(jsonBytes(formData), 65_536)
+  for (const actor of ['customer', 'admin'] as const) {
+    const input = { ...(actor === 'admin' ? adminBody(p) : body(p)), formData }
+    for (const [invalid, message] of [
+      [{ ...formData, extra: formData.extra + 'x' }, /填写信息不能超过 64 KiB/],
+      [{ note: formData.note + 'x' }, /10,000 个字符/],
+      [
+        { note: 'A'.repeat(9_950) + '\npassword=synthetic-only' },
+        /不得包含认证或付款凭证/,
+      ],
+    ] as const) {
+      const before = await db.order.count({ where: { productId: p.id } })
+      const rejected = await request(actor, { ...input, formData: invalid })
+      assert.equal(rejected.status, 400)
+      assert.equal(rejected.body.error.code, 'INVALID_INPUT')
+      assert.match(rejected.body.error.message, message)
+      assert.equal(await db.order.count({ where: { productId: p.id } }), before)
+    }
+    const key = randomUUID()
+    const created = await request(actor, input, key)
+    assert.equal(created.status, 201)
+    const id = created.body.order.id
+    const read = await request(
+      actor,
+      null,
+      null,
+      cookies[actor],
+      'GET',
+      '/' + id,
+    )
+    assert.equal(read.status, 200)
+    assert.deepEqual(read.body.order.formData, formData)
+    assert.equal(
+      read.body.order.formSchemaSnapshot.fields.length,
+      formSchema.fields.length,
+    )
+    assert.equal(
+      'defaultValue' in read.body.order.formSchemaSnapshot.fields[0],
+      actor === 'admin',
+    )
+    const stored = await db.order.findUniqueOrThrow({ where: { id } })
+    assert.deepEqual(stored.formSchemaSnapshot, formSchema)
+    const revision = await db.orderRevision.findFirstOrThrow({
+      where: { orderId: id },
+    })
+    assert.deepEqual(revision.snapshotJson, buildOrderSnapshot(stored))
+    const replay = await request(actor, input, key)
+    assert.equal(replay.status, 201)
+    assert.deepEqual(replay.body.order, created.body.order)
+    assert.equal(await db.orderRevision.count({ where: { orderId: id } }), 1)
+  }
+  assert.equal(await db.order.count({ where: { productId: p.id } }), 2)
 })

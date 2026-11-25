@@ -9,6 +9,8 @@ import { randomUUID } from 'node:crypto'
 import sharp from 'sharp'
 import { integrationEnvironment } from '../backend/test/integration/support.ts'
 import { createDatabase } from '../backend/src/db/client.ts'
+import { longTextarea } from '../backend/test/long-text-fixture.ts'
+import { pasteAtTextareaLimit } from './paste-textarea.ts'
 const env = integrationEnvironment()
 const db = createDatabase(env.DATABASE_URL)
 let adminCookies: Awaited<ReturnType<BrowserContext['cookies']>>
@@ -29,6 +31,10 @@ function guardRequests(page: Page) {
     if (
       url.pathname.startsWith('/api/') &&
       !catalogRead &&
+      !(
+        request.method() === 'GET' &&
+        url.pathname === '/api/v1/storefront/config'
+      ) &&
       !/^\/api\/v1\/(auth\/(login|me|logout)|admin\/(users|settings(?:\/wechat-(?:payment|qr))?|products(?:\/[^/]+(?:\/archive)?)?))$/.test(
         url.pathname,
       )
@@ -710,4 +716,35 @@ test('server rejects invalid form schemas without leaking values and unauthentic
   await context.clearCookies()
   expect((await page.request.get('/api/v1/admin/products')).status()).toBe(401)
   expect((await page.request.get('/api/v1/admin/settings')).status()).toBe(401)
+})
+
+test('textarea editor and preview accept a 10,000-character paste and preserve the saved default', async ({
+  page,
+}) => {
+  const dialog = await create(page, 'Long-text-' + randomUUID())
+  await dialog.getByRole('button', { name: '添加字段', exact: true }).click()
+  const field = dialog.locator('.form-field-editor')
+  await field.getByLabel('字段名称', { exact: true }).fill('服务说明')
+  await choose(
+    page,
+    field.getByRole('combobox', { name: '字段类型', exact: true }),
+    '多行文本',
+  )
+  await pasteAtTextareaLimit(
+    page,
+    field.getByLabel('字段默认值', { exact: true }),
+    longTextarea,
+  )
+  const preview = dialog.getByLabel('预览 服务说明', { exact: true })
+  await expect(preview).toHaveValue(longTextarea)
+  const previewOnly = 'B' + longTextarea.slice(1)
+  await pasteAtTextareaLimit(page, preview, previewOnly)
+  const response = await save(page, dialog)
+  const { product } = await response.json()
+  expect(product.formSchema.fields[0].defaultValue).toBe(longTextarea)
+  const read = await page.request.get('/api/v1/admin/products/' + product.id)
+  expect(read.status()).toBe(200)
+  expect((await read.json()).product.formSchema.fields[0].defaultValue).toBe(
+    longTextarea,
+  )
 })

@@ -14,6 +14,7 @@ import OrderNumber from '../../components/OrderNumber.vue'
 import ProductFormInputs from '../../components/ProductFormInputs.vue'
 import CustomerWechatPayment from './CustomerWechatPayment.vue'
 import { parseFormData } from '../../../../backend/src/contracts/form-data'
+import { formLimitErrorMessage } from '../../../../backend/src/contracts/form-limits'
 import { hasCredentialText } from '../../../../backend/src/contracts/credential-fields'
 import { formValueLabel, money } from '../../stores/format'
 import {
@@ -108,8 +109,10 @@ async function save() {
       let formData: FormData
       try {
         formData = parseFormData(snapshot.value.schema, draft.value)
-      } catch {
-        throw new Error('请核对服务信息并填写所有必填项。')
+      } catch (cause) {
+        actionError.value =
+          formLimitErrorMessage(cause) ?? '请核对服务信息并填写所有必填项。'
+        return
       }
       if (
         Object.values(formData)

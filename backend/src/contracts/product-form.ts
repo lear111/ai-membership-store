@@ -1,9 +1,15 @@
 // Public, browser-safe configuration contract. Never import environment or ORM code here.
 import { z } from 'zod'
+import {
+  FORM_TEXT_MAX_LENGTH,
+  jsonUtf8Bytes,
+  MAX_SCHEMA_BYTES,
+  schemaSizeMessage,
+  textareaValue,
+} from './form-limits.ts'
 
 export const MAX_FIELDS = 20
 export const MAX_OPTIONS = 20
-export const MAX_SCHEMA_BYTES = 8192
 const identifier = z
   .string()
   .regex(/^[A-Za-z][A-Za-z0-9_-]{0,63}$/)
@@ -27,7 +33,6 @@ const options = z
     if (new Set(items.map((item) => item.value)).size !== items.length)
       ctx.addIssue({ code: 'custom', message: '选项值不能重复' })
   })
-const textDefault = z.string().max(500).optional()
 const dateDefault = z
   .string()
   .regex(/^\d{4}-\d{2}-\d{2}$/)
@@ -42,17 +47,19 @@ export const formField = z.discriminatedUnion('type', [
   z.strictObject({
     ...common,
     type: z.literal('text'),
-    defaultValue: textDefault,
+    defaultValue: z.string().max(FORM_TEXT_MAX_LENGTH.text).optional(),
   }),
   z.strictObject({
     ...common,
     type: z.literal('email'),
-    defaultValue: z.union([z.email().max(254), z.literal('')]).optional(),
+    defaultValue: z
+      .union([z.email().max(FORM_TEXT_MAX_LENGTH.email), z.literal('')])
+      .optional(),
   }),
   z.strictObject({
     ...common,
     type: z.literal('textarea'),
-    defaultValue: textDefault,
+    defaultValue: textareaValue.optional(),
   }),
   z.strictObject({
     ...common,
@@ -119,10 +126,8 @@ export const productFormSchema = z
           })
       }
     })
-    if (
-      new TextEncoder().encode(JSON.stringify(schema)).length > MAX_SCHEMA_BYTES
-    )
-      ctx.addIssue({ code: 'custom', message: '表单配置不能超过 8 KiB' })
+    if (jsonUtf8Bytes(schema) > MAX_SCHEMA_BYTES)
+      ctx.addIssue({ code: 'custom', message: schemaSizeMessage })
   })
 export type ProductFormSchema = z.output<typeof productFormSchema>
 export type FormField = z.output<typeof formField>

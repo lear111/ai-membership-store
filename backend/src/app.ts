@@ -47,7 +47,7 @@ export function createApp(
     }
   })
 
-  app.use(express.json({ limit: '16kb', strict: true }))
+  app.use(express.json({ limit: 128 * 1024, strict: true }))
   if (options)
     app.use('/api/v1', applicationRoutes(options.database, options.env))
   app.use((_request, _response, next) =>

@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { FORM_TEXT_MAX_LENGTH } from '../../../backend/src/contracts/form-limits'
 import { computed } from 'vue'
 import {
   productFormSchema,
@@ -134,7 +135,7 @@ function removeOption(index: number, optionIndex: number) {
     </div>
     <p class="muted">
       仅配置必要的非敏感信息，禁止收集密码、验证码、令牌等秘密。最多 20
-      个字段、每字段 20 个选项，配置上限 8 KiB。
+      个字段、每字段 20 个选项，配置上限 64 KiB（UTF-8 字节）。
     </p>
     <p v-if="errors.length" class="form-error" role="alert">
       {{ errors.join('；') }}
@@ -273,7 +274,11 @@ function removeOption(index: number, optionIndex: number) {
           "
           step="any"
           aria-label="字段默认值"
-          maxlength="500"
+          :maxlength="
+            field.type === 'number' || field.type === 'date'
+              ? undefined
+              : FORM_TEXT_MAX_LENGTH[field.type]
+          "
       /></ElFormItem>
     </div>
     <ProductFormPreview :schema="modelValue" />

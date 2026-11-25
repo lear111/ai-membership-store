@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import { once } from 'node:events'
 import type { Server } from 'node:http'
 import { randomUUID } from 'node:crypto'
+import { formSchemaAtLimit, jsonBytes } from '../long-text-fixture.ts'
 import { createApp } from '../../src/app.ts'
 import { createDatabase, checkDatabase } from '../../src/db/client.ts'
 import { activeCredentials, integrationEnvironment } from './support.ts'
@@ -887,4 +888,38 @@ test('new API instance and database connection read persisted product/schema/set
     (await request('/admin/settings')).body.settings.storeName,
     'Persisted settings',
   )
+})
+
+test('product creation and editing enforce the UTF-8 schema cap and persist accepted defaults', async () => {
+  const formSchema = formSchemaAtLimit()
+  assert.equal(jsonBytes(formSchema), 65_536)
+  const created = await request('/admin/products', 'POST', {
+    ...original,
+    name: 'Long form ' + randomUUID(),
+    formSchema,
+  })
+  assert.equal(created.status, 201)
+  assert.deepEqual(created.body.product.formSchema, formSchema)
+  const path = '/admin/products/' + created.body.product.id
+  const first = formSchema.fields[0]!
+  first.defaultValue = 'B' + first.defaultValue.slice(1)
+  const updated = await request(path, 'PATCH', { formSchema })
+  assert.equal(updated.status, 200)
+  assert.deepEqual(updated.body.product.formSchema, formSchema)
+
+  const oversized = structuredClone(formSchema)
+  oversized.fields[2]!.defaultValue += 'x'
+  assert.equal(jsonBytes(oversized), 65_537)
+  for (const [url, method, input] of [
+    ['/admin/products', 'POST', { ...original, formSchema: oversized }],
+    [path, 'PATCH', { formSchema: oversized }],
+  ] as const) {
+    const rejected = await request(url, method, input)
+    assert.equal(rejected.status, 400)
+    assert.equal(rejected.body.error.code, 'INVALID_INPUT')
+    assert.match(rejected.body.error.message, /表单配置不能超过 64 KiB/)
+  }
+  const read = await request(path)
+  assert.equal(read.status, 200)
+  assert.deepEqual(read.body.product.formSchema, formSchema)
 })

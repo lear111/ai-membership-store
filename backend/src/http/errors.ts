@@ -1,6 +1,7 @@
 import type { ErrorRequestHandler } from 'express'
 import { Prisma } from '../generated/prisma/client.ts'
 import { ZodError } from 'zod'
+import { formLimitErrorMessage } from '../contracts/form-limits.ts'
 
 export class ApiError extends Error {
   status: number
@@ -22,7 +23,11 @@ export const errors: ErrorRequestHandler = (
   let failure = new ApiError(503, 'UNAVAILABLE', '服务暂时不可用，请稍后重试')
   if (error instanceof ApiError) failure = error
   else if (error instanceof ZodError || error instanceof SyntaxError)
-    failure = new ApiError(400, 'INVALID_INPUT', '请检查输入字段和格式')
+    failure = new ApiError(
+      400,
+      'INVALID_INPUT',
+      formLimitErrorMessage(error) ?? '请检查输入字段和格式',
+    )
   else if (error instanceof Prisma.PrismaClientKnownRequestError) {
     if (error.code === 'P2002')
       failure = new ApiError(409, 'EMAIL_EXISTS', '登录邮箱已被使用')

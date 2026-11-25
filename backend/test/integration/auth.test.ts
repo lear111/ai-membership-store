@@ -929,7 +929,7 @@ test('CSRF, malformed input and oversized requests are rejected without echoing 
       await request(
         '/auth/login',
         'POST',
-        { email: env.ADMIN_EMAIL, password: 'x'.repeat(17000) },
+        { email: env.ADMIN_EMAIL, password: 'x'.repeat(131_072) },
         '',
       )
     ).status,

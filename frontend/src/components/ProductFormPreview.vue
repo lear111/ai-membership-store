@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { FORM_TEXT_MAX_LENGTH } from '../../../backend/src/contracts/form-limits'
 import { computed, reactive, watch } from 'vue'
 import {
   productFormSchema,
@@ -105,7 +106,11 @@ watch(
           :placeholder="field.hint"
           :rows="3"
           step="any"
-          maxlength="500"
+          :maxlength="
+            field.type === 'number' || field.type === 'date'
+              ? undefined
+              : FORM_TEXT_MAX_LENGTH[field.type]
+          "
         />
         <small
           v-if="field.hint && ['radio', 'checkbox'].includes(field.type)"

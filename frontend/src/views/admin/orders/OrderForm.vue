@@ -14,6 +14,7 @@ import ProductFormInputs from '../../../components/ProductFormInputs.vue'
 import { productFormSchema } from '../../../../../backend/src/contracts/product-form'
 import { hasCredentialFields } from '../../../../../backend/src/contracts/credential-fields'
 import { parseFormData } from '../../../../../backend/src/contracts/form-data'
+import { formLimitErrorMessage } from '../../../../../backend/src/contracts/form-limits'
 import { money, parsePrice } from '../../../stores/format'
 const props = defineProps<{ order?: AdminOrder }>()
 const emit = defineEmits<{ close: []; saved: [AdminOrder]; stale: [] }>()
@@ -129,7 +130,9 @@ async function save() {
       uncertain.value =
         e instanceof SyntaxError ||
         (e instanceof ApiError && (e.status === 0 || e.status >= 500))
-      error.value = e instanceof Error ? e.message : '保存失败'
+      error.value =
+        formLimitErrorMessage(e) ??
+        (e instanceof Error ? e.message : '保存失败')
     }
   } finally {
     busy.value = false

@@ -1,5 +1,9 @@
 import { describe, expect, it } from 'vitest'
 import { productFormSchema } from '../../../../backend/src/contracts/product-form'
+import {
+  formDataAtLimit,
+  longTextFields,
+} from '../../../../backend/test/long-text-fixture'
 import { purchaseErrors } from './purchase-validation'
 
 const schema = productFormSchema.parse({
@@ -65,16 +69,14 @@ describe('purchase form validation', () => {
   })
 
   it('applies the shared byte limit across individually valid answers', () => {
-    const fields = Array.from({ length: 20 }, (_, index) => ({
-      id: 'field' + index,
-      type: 'textarea',
-      label: '项目 ' + index,
-      required: false,
-    }))
-    const wide = productFormSchema.parse({ version: 1, fields })
-    const values = Object.fromEntries(
-      fields.map(({ id }) => [id, '中'.repeat(300)]),
-    )
-    expect(purchaseErrors(wide, values)).toEqual(['填写信息不能超过 8 KiB'])
+    const wide = productFormSchema.parse({ version: 1, fields: longTextFields })
+    const data = formDataAtLimit()
+    expect(purchaseErrors(wide, data)).toEqual([])
+    expect(purchaseErrors(wide, { ...data, extra: data.extra + 'x' })).toEqual([
+      '填写信息不能超过 64 KiB（UTF-8 字节）',
+    ])
+    expect(purchaseErrors(wide, { note: data.note + 'x' })).toEqual([
+      'note · 请输入不超过 10,000 个字符的文本',
+    ])
   })
 })

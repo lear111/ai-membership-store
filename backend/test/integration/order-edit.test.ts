@@ -5,6 +5,11 @@ import { createHash, randomUUID } from 'node:crypto'
 import { execFileSync } from 'node:child_process'
 import type { Server } from 'node:http'
 import { isDeepStrictEqual } from 'node:util'
+import {
+  formDataAtLimit,
+  jsonBytes,
+  longTextFields,
+} from '../long-text-fixture.ts'
 import { createApp } from '../../src/app.ts'
 import { createDatabase, checkDatabase } from '../../src/db/client.ts'
 import { Prisma, type User } from '../../src/generated/prisma/client.ts'
@@ -1052,4 +1057,44 @@ test('waiting for a locked order rechecks database expiry rather than using requ
     (await db.order.findUniqueOrThrow({ where: { id: order.id } })).version,
     2,
   )
+})
+
+test('both order editors accept 64 KiB and retain the original short revision', async () => {
+  const frozen = { version: 1, fields: longTextFields }
+  const formData = formDataAtLimit()
+  assert.equal(jsonBytes(formData), 65_536)
+  for (const role of ['customer', 'admin'] as const) {
+    const old = await fixture({
+      formSchemaSnapshot: frozen,
+      formData: { note: '历史短文本' },
+    })
+    const reject = await request(role, old.id, {
+      expectedVersion: 1,
+      formData: { ...formData, extra: formData.extra + 'x' },
+    })
+    assert.equal(reject.status, 400)
+    assert.match(reject.body.error.message, /填写信息不能超过 64 KiB/)
+    const unchanged = await db.order.findUniqueOrThrow({
+      where: { id: old.id },
+    })
+    assert.deepEqual(unchanged.formData, old.formData)
+    assert.equal(unchanged.version, 1)
+    const updated = await request(role, old.id, {
+      expectedVersion: 1,
+      formData,
+    })
+    assert.equal(updated.status, 200)
+    assert.equal(updated.body.order.version, 2)
+    assert.deepEqual(updated.body.order.formData, formData)
+    const revisions = await db.orderRevision.findMany({
+      where: { orderId: old.id },
+      orderBy: { version: 'asc' },
+    })
+    const stored = await db.order.findUniqueOrThrow({ where: { id: old.id } })
+    assert.deepEqual(stored.formSchemaSnapshot, frozen)
+    assert.deepEqual(
+      revisions.map((revision) => revision.snapshotJson),
+      [buildOrderSnapshot(old), buildOrderSnapshot(stored)],
+    )
+  }
 })

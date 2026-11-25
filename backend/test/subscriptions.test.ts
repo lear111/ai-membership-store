@@ -95,7 +95,7 @@ test('all eight form values validate by stable ID without coercion or executing 
   for (const [key, value] of Object.entries({
     text: '',
     email: 'invalid',
-    textarea: 'x'.repeat(501),
+    textarea: 'x'.repeat(10_001),
     select: 'unknown',
     radio: 'a',
     checkbox: ['c', 'c'],
