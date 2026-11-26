@@ -223,6 +223,7 @@ sql "$source_id" -e "UPDATE _prisma_migrations SET checksum='$alternate_checksum
 operate backup
 run1=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["run"])' "$root/state/backup.json")
 if [[ -n ${T273_WINDOWS_INCOMING:-} ]]; then
+  T273_TEST_RESTIC="$root/restic" python3 -B -m unittest discover -s "$driver/test" -p test_windows_manifest.py
   python3 -B "$driver/test/windows_rehearsal.py" "$root" "$archive" \
     "$T273_RUNTIME_ARCHIVE" "$T273_WINDOWS_INCOMING"
   mapfile -t windows < <(python3 -c '

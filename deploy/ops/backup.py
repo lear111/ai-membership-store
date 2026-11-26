@@ -250,9 +250,10 @@ class Repository:
             self.tunnel.verify_listener()
         return command([*self.args, *args], error, env=self.env, timeout=timeout)
 
-    def snapshot(self, run, part, *args):
+    def snapshot(self, run, part, *args, staged=False):
+        tags = [] if staged else ["--tag", TAG]
         output = self.call(
-            "--json", "backup", "--tag", TAG, "--tag", "run:" + run, "--tag", part,
+            "--json", "backup", *tags, "--tag", "run:" + run, "--tag", part,
             *args, error="BACKUP_" + part.upper(),
         )
         ids = [item.get("snapshot_id", "") for line in output.splitlines()
@@ -260,6 +261,17 @@ class Repository:
         if len(ids) != 1 or not SNAPSHOT.fullmatch(ids[0]):
             raise Failure("SNAPSHOT_ID_MISSING")
         return ids[0]
+
+    def publish_manifest(self, snapshot_id):
+        if not SNAPSHOT.fullmatch(snapshot_id):
+            raise Failure("SNAPSHOT_ID_MISSING")
+        output = self.call("--json", "tag", "--add", TAG, snapshot_id, error="BACKUP_MANIFEST_PUBLISH")
+        changes = [item for line in output.splitlines()
+                   if (item := json.loads(line)).get("message_type") == "changed"]
+        if (len(changes) != 1 or changes[0].get("old_snapshot_id") != snapshot_id
+                or not SNAPSHOT.fullmatch(changes[0].get("new_snapshot_id", ""))):
+            raise Failure("BACKUP_MANIFEST_PUBLISH")
+        return changes[0]["new_snapshot_id"]
 
     def snapshots(self):
         return json.loads(self.call("--json", "snapshots", "--tag", TAG, timeout=60))
@@ -525,7 +537,13 @@ def backup(repo, settings, state, fixture, *, archive=None, pre_migration=False)
             if pre_migration and runtime_check(archive) != runtime:
                 raise Failure("MAINTENANCE_STATE_CHANGED")
             marker = repo.snapshot(run, "manifest", "--stdin-from-command", "--stdin-filename",
-                                   "manifest.json", "--", "cat", str(file))
+                                   "manifest.json", "--", "cat", str(file), staged=pre_migration)
+            if pre_migration:
+                # An uploaded manifest stays outside the application tag until
+                # its upload is known to have spanned the same stopped runtime.
+                if runtime_check(archive) != runtime:
+                    raise Failure("MAINTENANCE_STATE_CHANGED")
+                marker = repo.publish_manifest(marker)
         write_json(status_path, {"lastSuccessAt": completed, "lastAttemptAt": completed,
                                  "run": run, "manifest": marker, "result": "success"})
         log("backup_completed", run=run, tables=len(before["tables"]), migrations=len(before["migrations"]),
@@ -554,7 +572,7 @@ def groups(repo):
 
 
 def load_manifest(repo, run, parts):
-    if set(parts) != {"database", "images", "manifest"}:
+    if set(parts) != {"database", "images", "manifest"} or TAG not in parts["manifest"].get("tags", []):
         raise Failure("BACKUP_INCOMPLETE")
     meta = json.loads(repo.call("dump", parts["manifest"]["id"], "/manifest.json", timeout=60))
     if (meta.get("format") != 1 or meta.get("run") != run
