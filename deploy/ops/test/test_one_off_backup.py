@@ -13,7 +13,7 @@ import time
 import uuid
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 OPS = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(OPS), str(OPS / "one-off")]
@@ -26,6 +26,39 @@ RESTIC = os.environ.get("T275_TEST_RESTIC")
 SQL = "CREATE TABLE fixture (value int); INSERT INTO fixture VALUES (17);\n"
 USER = "membership_backup_012345678abc"
 RUN = "012345678abc" + "0" * 20
+
+# A private DNS responder for the two forward/reverse records used by the MySQL fixture.
+DNS_FIXTURE = r"""
+import ipaddress
+import socket
+import struct
+import sys
+
+def wire(name):
+    return b"".join(bytes([len(label)]) + label.encode() for label in name.split(".")) + b"\0"
+
+address = ipaddress.IPv4Address(sys.argv[1])
+hostname = wire(sys.argv[2])
+records = {
+    hostname + struct.pack("!HH", 1, 1): (1, address.packed),
+    wire(address.reverse_pointer) + struct.pack("!HH", 12, 1): (12, hostname),
+}
+with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as server:
+    server.bind(("0.0.0.0", 53))
+    while True:
+        query, peer = server.recvfrom(512)
+        end = query.find(b"\0", 12)
+        if end < 0 or len(query) < end + 5:
+            continue
+        question = query[12:end + 5]
+        answer = records.get(question.lower())
+        header = query[:2] + struct.pack("!HHHHH", 0x8180, 1, int(answer is not None), 0, 0)
+        response = header + question
+        if answer:
+            kind, data = answer
+            response += b"\xc0\x0c" + struct.pack("!HHIH", kind, 1, 0, len(data)) + data
+        server.sendto(response, peer)
+"""
 
 
 class Fixture:
@@ -52,6 +85,8 @@ class Fixture:
         self.cnf = root / "fixture.mysql.cnf"
         self.active = False
         self.collision = False
+        self.principal = f"{USER}@{self.config.account_host}"
+        self.cipher = "TLS_AES_256_GCM_SHA384"
         self.grants = []
         self.calls = []
         self.archive = SimpleNamespace(archive_sha256=self.config.operations_sha256,
@@ -98,8 +133,7 @@ class Fixture:
             usage = f"GRANT USAGE ON *.* TO {chr(96)}{USER}{chr(96)}@{chr(96)}{self.config.account_host}{chr(96)}"
             return "\n".join([usage, *self.grants]).encode()
         if error == "BACKUP_CLIENT_TLS":
-            return (json.dumps([f"{USER}@192.0.2.7", f"{USER}@{self.config.account_host}"])
-                    + "\nSsl_cipher\tTLS_AES_256_GCM_SHA384\n").encode()
+            return (json.dumps(self.principal) + f"\nSsl_cipher\t{self.cipher}\n").encode()
         return existing.command(args, error, **kwargs)
 
     def perform(self, capture=None):
@@ -115,6 +149,58 @@ class Fixture:
             RESTIC, "--no-cache", "--repo", str(base / f"membership-{RUN}"),
             "--password-file", str(base / "restic-password"), *args,
         ])
+
+
+class DockerEndpointTests(unittest.TestCase):
+    def assert_startup_rejected(self, mode, environment, endpoint, error):
+        config = SimpleNamespace(driver_directory=OPS.parent)
+        with (patch.dict(os.environ, environment, clear=True),
+              patch.object(sys, "argv", ["backup_vps_local.py", mode, "--run", RUN, "--config", "/fixture.json"]),
+              patch.object(sys, "path", sys.path.copy()),
+              patch.object(sys, "dont_write_bytecode", True),
+              patch.object(os, "getuid", return_value=0),
+              patch.object(os, "getgid", return_value=0),
+              patch.object(oneoff, "load_configuration", return_value=config),
+              patch.object(existing, "docker", return_value=endpoint) as docker,
+              patch.object(existing, "command") as command,
+              patch.object(oneoff, "account_count") as account_count,
+              patch.object(oneoff, "capture") as capture,
+              patch.object(oneoff, "perform") as perform):
+            with self.assertRaisesRegex(oneoff.Rejected, error):
+                oneoff.main()
+        command.assert_not_called()
+        account_count.assert_not_called()
+        capture.assert_not_called()
+        perform.assert_not_called()
+        return docker
+
+    def test_docker_host_is_rejected_before_any_docker_command(self):
+        for value in ("tcp://192.0.2.42:2375", ""):
+            with self.subTest(value=value):
+                docker = self.assert_startup_rejected("--execute", {"DOCKER_HOST": value}, None,
+                                                      "LOCAL_DOCKER_ENVIRONMENT_REQUIRED")
+                docker.assert_not_called()
+
+    def test_docker_context_is_rejected_before_any_docker_command(self):
+        for value in ("alternate", ""):
+            with self.subTest(value=value):
+                docker = self.assert_startup_rejected("--dry-run", {"DOCKER_CONTEXT": value}, None,
+                                                      "LOCAL_DOCKER_ENVIRONMENT_REQUIRED")
+                docker.assert_not_called()
+
+    def test_nondefault_context_endpoints_are_rejected_before_database_access(self):
+        for endpoint in (b"tcp://192.0.2.42:2375\n", b"ssh://fixture.invalid\n", b"unix:///tmp/docker.sock\n", b""):
+            for mode in ("--dry-run", "--execute"):
+                with self.subTest(endpoint=endpoint, mode=mode):
+                    docker = self.assert_startup_rejected(mode, {}, endpoint, "LOCAL_DOCKER_SOCKET_REQUIRED")
+                    docker.assert_called_once_with("context", "inspect", "--format", "{{.Endpoints.docker.Host}}")
+
+    def test_default_local_socket_is_accepted(self):
+        ops = Mock()
+        ops.docker.return_value = b"unix:///var/run/docker.sock\n"
+        with patch.dict(os.environ, clear=True):
+            oneoff.require_local_docker(ops)
+        ops.docker.assert_called_once_with("context", "inspect", "--format", "{{.Endpoints.docker.Host}}")
 
 
 class BackupTests(unittest.TestCase):
@@ -151,6 +237,18 @@ class BackupTests(unittest.TestCase):
                 fixture.perform()
         self.assertFalse(fixture.staging.exists())
         self.assertNotIn("CREATE_BACKUP_ACCOUNT", fixture.calls)
+
+    def test_unscoped_principal_and_empty_tls_cipher_are_rejected(self):
+        fixture = self.fixture
+        for principal, cipher in ((f"{USER}@%", fixture.cipher), (fixture.principal, "")):
+            with (self.subTest(principal=principal, cipher=cipher),
+                  patch.object(fixture, "principal", principal), patch.object(fixture, "cipher", cipher),
+                  patch.object(oneoff, "CNF", fixture.cnf), patch.object(existing, "private_file", return_value=True),
+                  self.assertRaisesRegex(oneoff.Rejected, "BACKUP_CLIENT_IDENTITY_OR_TLS")):
+                with oneoff.backup_account(fixture, fixture.config, USER, {}, fixture.paths, fixture.baseline):
+                    self.fail("Unexpected backup")
+            self.assertFalse(fixture.active)
+            self.assertFalse(fixture.cnf.exists())
 
     @unittest.skipUnless(RESTIC, "Set T275_TEST_RESTIC to a verified Restic 0.20.0 binary")
     def test_real_restic_backup_and_readback(self):
@@ -232,9 +330,14 @@ class MysqlBackupTests(unittest.TestCase):
         self.assertTrue(RESTIC, "Set T275_TEST_RESTIC for the MySQL fixture")
         docker = shutil.which("docker")
         self.assertTrue(docker, "Local Docker CLI required")
+        oneoff.require_local_docker(existing)
         suffix = uuid.uuid4().hex[:12]
         network = f"membership-t275-fixture-{suffix}"
+        app_network = f"membership-t275-app-{suffix}"
         instance = f"membership-t275-mysql-{suffix}"
+        client = f"membership-t275-client-{suffix}"
+        dns = f"membership-t275-dns-{suffix}"
+        client_hostname = "backup-client.fixture.test"
 
         def control(*args):
             return subprocess.check_output([docker, *args], stderr=subprocess.PIPE, timeout=90)
@@ -242,30 +345,82 @@ class MysqlBackupTests(unittest.TestCase):
         def cleanup(*args):
             subprocess.run([docker, *args], check=False, capture_output=True, timeout=30)
 
-        control("network", "create", "--internal", network)
-        self.addCleanup(cleanup, "network", "rm", network)
-        control("run", "-d", "--rm", "--pull", "never", "--network", network, "--hostname", "mysql",
+        # Render the production service options without starting its project, publishing ports, or mounting secrets.
+        services = json.loads(control(
+            "compose", "--env-file", "/dev/null", "-p", f"membership-t275-fixture-{suffix}",
+            "-f", str(OPS.parent / "mysql/compose.yaml"), "-f", str(OPS.parent / "mysql/backup.compose.yaml"),
+            "--profile", "backup", "config", "--format", "json",
+        ))["services"]
+        server, backup_client = services["mysql"], services["backup-client"]
+        self.assertEqual(server["image"], existing.IMAGE)
+        for bridge in (network, app_network):
+            control("network", "create", "--internal", bridge)
+            self.addCleanup(cleanup, "network", "rm", bridge)
+        control("run", "-d", "--rm", "--pull", "never", "--platform", server["platform"],
+                "--network", network, "--network-alias", "mysql", "--hostname", "mysql",
                 "--tmpfs", "/var/lib/mysql:size=512m", "--name", instance,
-                "-e", "MYSQL_ALLOW_EMPTY_PASSWORD=yes", "-e", f"MYSQL_DATABASE={oneoff.SCHEMA}",
-                existing.IMAGE, "--skip-name-resolve", "--skip-log-bin")
+                "-e", "MYSQL_ALLOW_EMPTY_PASSWORD=yes", "-e", "MYSQL_ROOT_HOST=localhost",
+                "-e", f"MYSQL_DATABASE={oneoff.SCHEMA}", "--entrypoint", "sh", server["image"], "-ec",
+                # A trailing OFF option does not clear the resolver-disable flag set by the image's my.cnf.
+                "sed -i '/^[[:space:]]*skip-name-resolve[[:space:]]*$/d' /etc/my.cnf; "
+                'exec docker-entrypoint.sh mysqld "$@"', "fixture-mysql", *server["command"],
+                "--skip-name-resolve=OFF")
         self.addCleanup(cleanup, "rm", "-f", instance)
+        control("network", "connect", app_network, instance)
+        control("run", "-d", "--rm", "--pull", "never", "--platform", backup_client["platform"],
+                "--read-only", "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
+                "--tmpfs", "/run/secrets:size=1m", "--network", network, "--name", client,
+                "--entrypoint", "sleep", backup_client["image"], "infinity")
+        self.addCleanup(cleanup, "rm", "-f", client)
         mysql = [docker, "exec", instance, "mysql", "--protocol=socket", "--user=root",
                  *oneoff.SQL_OPTIONS, oneoff.SCHEMA]
         for _ in range(90):
             try:
-                version = existing.command([*mysql, "-e", "SELECT VERSION()"], "FIXTURE_START")
+                existing.command([docker, "exec", client, "mysqladmin", "--protocol=TCP", "--host=mysql",
+                                  "--silent", "ping"], "FIXTURE_START")
+                version, skip_name_resolve = existing.rows(mysql, "SELECT JSON_ARRAY(VERSION(), @@skip_name_resolve)")[0]
                 break
             except Failure:
                 time.sleep(1)
         else:
             self.fail("Disposable MySQL did not become ready")
-        self.assertEqual(version.strip(), b"8.4.13")
+        self.assertEqual(version, "8.4.13")
+        self.assertEqual(skip_name_resolve, 0)
+        client_networks = json.loads(control("inspect", client))[0]["NetworkSettings"]["Networks"]
+        self.assertEqual(set(client_networks), {network})
+        client_ip = client_networks[network]["IPAddress"]
+        control("run", "-d", "--rm", "--pull", "never", "--network", app_network, "--name", dns,
+                "--entrypoint", "python3", "ai-membership-store-t233-fixture-runner:local",
+                "-B", "-c", DNS_FIXTURE, client_ip, client_hostname)
+        self.addCleanup(cleanup, "rm", "-f", dns)
+        dns_ip = json.loads(control("inspect", dns))[0]["NetworkSettings"]["Networks"][app_network]["IPAddress"]
+
+        def use_resolver(address):
+            control("exec", "--user", "0", instance, "sh", "-c",
+                    "printf 'nameserver %s\\noptions timeout:1 attempts:1\\n' \"$1\" >/etc/resolv.conf",
+                    "fixture-resolver", address)
+            existing.command([*mysql, "-e", "TRUNCATE TABLE performance_schema.host_cache"], "FIXTURE_CLEAR_HOST_CACHE")
+
+        use_resolver(dns_ip)
+        for _ in range(10):
+            try:
+                reverse = control("exec", instance, "getent", "hosts", client_ip).decode().split()
+                break
+            except subprocess.CalledProcessError:
+                time.sleep(1)
+        else:
+            self.fail("Disposable DNS did not return the fixture PTR record")
+        self.assertEqual(reverse[:2], [client_ip, client_hostname])
+        forward = control("exec", instance, "getent", "ahostsv4", client_hostname).decode().split()
+        self.assertEqual(forward[0], client_ip)
         existing.command([*mysql, "-e",
                           "CREATE TABLE " + chr(96) + "Order" + chr(96) + " (value int);"
                           "CREATE TABLE OrderRevision (value int);"
                           "CREATE TRIGGER fixture_trigger BEFORE INSERT ON " + chr(96) + "Order" + chr(96)
                           + " FOR EACH ROW SET NEW.value = NEW.value + 1;"
                           "INSERT INTO " + chr(96) + "Order" + chr(96) + " VALUES (16);"], "FIXTURE_SCHEMA")
+
+        identities = []
 
         class LiveMysql(Fixture):
             collision = False
@@ -276,9 +431,15 @@ class MysqlBackupTests(unittest.TestCase):
             def command(self, args, error, **kwargs):
                 self.calls.append(error)
                 if error == "BACKUP_CLIENT_TLS":
-                    existing.command([docker, "exec", "-i", instance, "sh", "-c",
-                                      "umask 077; mkdir -p /run/secrets; cat >/run/secrets/backup.mysql.cnf"],
+                    existing.command([docker, "exec", "-i", client, "sh", "-c",
+                                      "umask 077; cat >/run/secrets/backup.mysql.cnf"],
                                      "FIXTURE_COPY_CNF", input=self.cnf.read_bytes())
+                    result = existing.command([
+                        *args[:-1], args[-1] + "; SELECT JSON_ARRAY(USER(), CURRENT_USER(), @@skip_name_resolve)",
+                    ], error, **kwargs)
+                    proof, details = result.rstrip(b"\n").rsplit(b"\n", 1)
+                    identities.append(json.loads(details))
+                    return proof
                 if error == "CREATE_BACKUP_ACCOUNT" and self.collision:
                     existing.command(args, "FIXTURE_CONCURRENT_CREATE")
                 return existing.command(args, error, **kwargs)
@@ -286,7 +447,7 @@ class MysqlBackupTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as work:
             fixture = LiveMysql(Path(work))
             fixture.config.root_mysql = mysql
-            fixture.config.client = [docker, "exec", instance]
+            fixture.config.client = [docker, "exec", client]
             options = json.loads(control("network", "inspect", network))[0]
             self.assertTrue(options["Internal"])
             self.assertFalse(json.loads(control("inspect", instance))[0]["HostConfig"]["PortBindings"])
@@ -294,6 +455,11 @@ class MysqlBackupTests(unittest.TestCase):
             fixture.config.account_host = fixture.config.subnet.with_netmask
 
             fixture.perform()
+            origin, principal, skip_name_resolve = identities[-1]
+            self.assertEqual(origin, f"{USER}@{client_hostname}")
+            self.assertEqual(principal, f"{USER}@{fixture.config.account_host}")
+            self.assertEqual(skip_name_resolve, 0)
+            print(f"Fixture DNS USER()={origin} CURRENT_USER()={principal} skip_name_resolve={skip_name_resolve}")
             receipt = json.loads((fixture.destination / "transfer.json").read_text())
             dump = fixture.restic(fixture.destination, "dump", receipt["snapshotIds"]["database"], "/database.sql")
             self.assertIn(b"fixture_trigger", dump)
@@ -301,10 +467,17 @@ class MysqlBackupTests(unittest.TestCase):
             self.assertEqual(oneoff.account_count(fixture, fixture.config, USER), 0)
             self.assertFalse(fixture.cnf.exists())
 
+            # Simulate a failed PTR lookup for the same client. MySQL name resolution stays enabled.
+            use_resolver("127.0.0.1")
             with patch.object(oneoff, "CNF", fixture.cnf):
                 with self.assertRaisesRegex(oneoff.Rejected, "BACKUP_INTERRUPTED_BY_SIGTERM"):
                     with oneoff.backup_account(fixture, fixture.config, USER, {}, fixture.paths, fixture.baseline):
                         oneoff.interrupted(signal.SIGTERM, None)
+                origin, principal, skip_name_resolve = identities[-1]
+                self.assertEqual(origin, f"{USER}@{client_ip}")
+                self.assertEqual(principal, f"{USER}@{fixture.config.account_host}")
+                self.assertEqual(skip_name_resolve, 0)
+                print(f"Fixture IP USER()={origin} CURRENT_USER()={principal} skip_name_resolve={skip_name_resolve}")
                 self.assertEqual(oneoff.account_count(fixture, fixture.config, USER), 0)
                 self.assertFalse(fixture.cnf.exists())
 

@@ -29,6 +29,7 @@ PROJECT = "ai-membership-store-production"
 CONTAINER = PROJECT + "-mysql-1"
 NETWORK = PROJECT + "_backup"
 SCHEMA = "membership_production"
+LOCAL_DOCKER_SOCKET = "unix:///var/run/docker.sock"
 SQL_OPTIONS = ["--batch", "--raw", "--skip-column-names"]
 GIB = 1024**3
 CLIENT_FILE = "--defaults-extra-file=/run/secrets/backup.mysql.cnf"
@@ -93,13 +94,15 @@ def load_configuration(path):
     require(subnet.is_private and subnet.prefixlen < 31, "BACKUP_SUBNET")
     data["subnet"] = subnet
     data["account_host"] = subnet.with_netmask
+    # The streamed dump runs with a minimal environment. Keep both clients on the verified socket.
+    docker = ["docker", "--host", LOCAL_DOCKER_SOCKET]
     data["root_mysql"] = [
-        "docker", "exec", data["mysql_container_id"], "sh", "-c",
+        *docker, "exec", data["mysql_container_id"], "sh", "-c",
         'MYSQL_PWD="$(cat /run/secrets/mysql_root_password)" exec mysql --user=root --protocol=socket "$@"',
         "mysql", *SQL_OPTIONS, SCHEMA,
     ]
     data["client"] = [
-        "docker", "compose", "--env-file", "/dev/null", "-p", PROJECT,
+        *docker, "compose", "--env-file", "/dev/null", "-p", PROJECT,
         "-f", str(driver / "mysql/compose.yaml"), "-f", str(driver / "mysql/backup.compose.yaml"),
         "--profile", "backup", "run", "--rm", "-T", "--no-deps", "--pull", "never", "backup-client",
     ]
@@ -131,6 +134,13 @@ def require_backup_space(ops, config, image_inventory):
     available = shutil.disk_usage(config.backup_root).free
     require(available >= estimate + GIB, "INSUFFICIENT_DISK_HEADROOM")
     return available, estimate
+
+
+def require_local_docker(ops):
+    require(not any(name in os.environ for name in ("DOCKER_HOST", "DOCKER_CONTEXT")),
+            "LOCAL_DOCKER_ENVIRONMENT_REQUIRED")
+    endpoint = ops.docker("context", "inspect", "--format", "{{.Endpoints.docker.Host}}").strip()
+    require(endpoint == LOCAL_DOCKER_SOCKET.encode(), "LOCAL_DOCKER_SOCKET_REQUIRED")
 
 
 def check_mysql(ops, config):
@@ -232,14 +242,13 @@ def backup_account(ops, config, user, expected, paths, baseline):
                              f"FROM mysql.user WHERE User='{user}' AND Host='{config.account_host}'") == [[1]],
                 "BACKUP_ACCOUNT_NOT_LEAST_PRIVILEGE")
         mysql = [*config.client, "mysql", CLIENT_FILE, *SQL_OPTIONS, SCHEMA]
-        identity = ops.command([*mysql, "-e", "SELECT JSON_ARRAY(USER(),CURRENT_USER());"
+        identity = ops.command([*mysql, "-e", "SELECT JSON_QUOTE(CURRENT_USER());"
                                 "SHOW SESSION STATUS LIKE 'Ssl_cipher'"], "BACKUP_CLIENT_TLS")
         who, status = identity.decode().splitlines()
-        origin, principal = json.loads(who)
+        principal = json.loads(who)
         variable, cipher = status.split("\t")
-        name, address = origin.split("@")
-        require(name == user and ipaddress.IPv4Address(address) in config.subnet
-                and principal == f"{user}@{config.account_host}" and variable == "Ssl_cipher" and bool(cipher),
+        # The account's IPv4 netmask limits where it can match. USER() can report a DNS name.
+        require(principal == f"{user}@{config.account_host}" and variable == "Ssl_cipher" and bool(cipher),
                 "BACKUP_CLIENT_IDENTITY_OR_TLS")
         require(ops.inventory(mysql, expected) == baseline[2] and ops.table_counts(mysql) == baseline[3],
                 "BACKUP_CLIENT_VISIBILITY")
@@ -358,6 +367,7 @@ def main():
     import backup as ops
     from windows_backup import verified_operations
 
+    require_local_docker(ops)
     restic_version = ops.command([str(config.restic_binary), "version"], "RESTIC_VERSION")
     require(restic_version.startswith(b"restic 0.20.0 ") and b"linux/amd64" in restic_version, "RESTIC_VERSION")
     archive = verified_operations(config.operations_archive, config.operations_sha256)
