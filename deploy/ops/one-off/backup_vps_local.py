@@ -30,6 +30,7 @@ CONTAINER = PROJECT + "-mysql-1"
 NETWORK = PROJECT + "_backup"
 SCHEMA = "membership_production"
 SQL_OPTIONS = ["--batch", "--raw", "--skip-column-names"]
+GIB = 1024**3
 CLIENT_FILE = "--defaults-extra-file=/run/secrets/backup.mysql.cnf"
 
 
@@ -105,16 +106,31 @@ def load_configuration(path):
     return SimpleNamespace(**data)
 
 
-def file_hashes(directory):
+def file_inventory(directory):
     result = {}
     for folder, dirs, files in os.walk(directory, followlinks=False):
         for name in sorted(dirs + files):
             path = Path(folder) / name
-            mode = path.lstat().st_mode
-            require(stat.S_ISDIR(mode) or stat.S_ISREG(mode), "UNEXPECTED_FILE_TYPE")
-            if stat.S_ISREG(mode):
-                result[path.relative_to(directory).as_posix()] = file_hash(path)
+            entry = path.lstat()
+            require(stat.S_ISDIR(entry.st_mode) or stat.S_ISREG(entry.st_mode), "UNEXPECTED_FILE_TYPE")
+            if stat.S_ISREG(entry.st_mode):
+                result[path.relative_to(directory).as_posix()] = {"sha256": file_hash(path), "bytes": entry.st_size}
     return dict(sorted(result.items()))
+
+
+def require_backup_space(ops, config, image_inventory):
+    table_bytes, = ops.rows(config.root_mysql, """
+        SELECT JSON_ARRAY(CAST(COALESCE(SUM(DATA_LENGTH + INDEX_LENGTH), 0) AS UNSIGNED))
+        FROM information_schema.TABLES
+        WHERE TABLE_SCHEMA = DATABASE() AND TABLE_TYPE = 'BASE TABLE'
+    """)[0]
+    require(type(table_bytes) is int and table_bytes > 0, "MYSQL_SIZE_UNAVAILABLE")
+    image_bytes = sum(file["bytes"] for directory in image_inventory for file in directory.values())
+    # Allow for the SQL representation (including hex BLOBs) and pack overhead without assuming compression.
+    estimate = 4 * table_bytes + image_bytes
+    available = shutil.disk_usage(config.backup_root).free
+    require(available >= estimate + GIB, "INSUFFICIENT_DISK_HEADROOM")
+    return available, estimate
 
 
 def check_mysql(ops, config):
@@ -164,7 +180,7 @@ def capture(ops, config, archive, expected, paths):
     inventory = ops.inventory(config.root_mysql, expected)
     ops.check_image_references(config.root_mysql, paths, "IMAGE_REFERENCE_MISSING")
     counts = ops.table_counts(config.root_mysql)
-    images = [file_hashes(path) for path in paths]
+    images = [file_inventory(path) for path in paths]
     require(ops.maintenance_runtime(archive) == runtime, "MAINTENANCE_STATE_CHANGED")
     return (runtime, mysql, inventory, counts, images)
 
@@ -186,10 +202,12 @@ def backup_account(ops, config, user, expected, paths, baseline):
             "BACKUP_ACCOUNT_OR_FILE_EXISTS")
     try:
         # Capture the server-generated password in memory. SQL and child stderr stay out of logs.
+        response = ops.command([*config.root_mysql, "-e",
+                                f"CREATE USER {subject} IDENTIFIED BY RANDOM PASSWORD REQUIRE SSL"],
+                               "CREATE_BACKUP_ACCOUNT")
         created = True
-        result = ops.command([*config.root_mysql, "-e",
-                              f"CREATE USER {subject} IDENTIFIED BY RANDOM PASSWORD REQUIRE SSL"],
-                             "CREATE_BACKUP_ACCOUNT").decode().strip().split("\t")
+        result = response.decode().strip().split("\t")
+        del response
         require(len(result) == 4 and result[:2] == [user, config.account_host]
                 and re.fullmatch(r"[\x21-\x7e]{16,128}", result[2]), "GENERATED_PASSWORD_OUTPUT")
         escaped = result[2].replace("\\", "\\\\").replace('"', '\\"')
@@ -258,6 +276,7 @@ def perform(ops, config, archive, expected, paths, baseline, run, destination, u
 
     with ops.lock(ops.STATE, "repository"):
         fence()
+        require_backup_space(ops, config, baseline[4])
         staging = destination.with_suffix(".partial")
         staging.mkdir(mode=0o700)
         require(root_owned(staging, stat.S_ISDIR), "VPS_DESTINATION_PERMISSIONS")
@@ -281,7 +300,9 @@ def perform(ops, config, archive, expected, paths, baseline, run, destination, u
             "completedAt": ops.utc(), "releaseSha": config.release_sha, "inventory": baseline[2],
             "databaseSnapshot": database, "imagesSnapshot": images, "imagePaths": list(map(str, paths)),
             "localBackup": {**ops.windows_release_evidence(archive), "tableCounts": baseline[3],
-                            "imageSha256": baseline[4], "transport": "vps-local-ssh-pull"},
+                            "imageSha256": [{name: file["sha256"] for name, file in directory.items()}
+                                            for directory in baseline[4]],
+                            "transport": "vps-local-ssh-pull"},
         }
         payload = staging / "manifest-staging.json"
         ops.write_json(payload, manifest)
@@ -297,12 +318,15 @@ def perform(ops, config, archive, expected, paths, baseline, run, destination, u
             repo.call("check", "--read-data", error="RESTIC_FULL_DATA_CHECK")
             require(ops.load_manifest(repo, run, ops.groups(repo)[run]) == manifest,
                     "MANIFEST_REOPEN_MISMATCH")
-            files = file_hashes(repository)
+            files = file_inventory(repository)
             require(files and "config" in files and not any(path.startswith("locks/") for path in files),
                     "REPOSITORY_NOT_READY_TO_TRANSFER")
+            repository_bytes = sum(file["bytes"] for file in files.values())
+            require(shutil.disk_usage(config.backup_root).free >= GIB, "INSUFFICIENT_DISK_HEADROOM")
             fence()
             ops.write_json(staging / "transfer.json", {
-                "format": 1, "run": run, "releaseSha": config.release_sha, "repository": repository.name,
+                "format": 2, "run": run, "releaseSha": config.release_sha, "repository": repository.name,
+                "repositoryBytes": repository_bytes,
                 "files": files, "snapshotIds": {"database": database, "images": images, "manifest": marker},
                 "tableCount": len(baseline[2]["tables"]), "migrationCount": len(baseline[2]["migrations"]),
                 "triggerCount": baseline[2]["triggerCount"], "operationsArchiveSha256": config.operations_sha256,
@@ -351,9 +375,7 @@ def main():
     require(not any(destination.is_relative_to(path) for path in [ops.RELEASE_ROOT, *paths, Path("/var/lib/docker")]),
             "BACKUP_ROOT_OVERLAPS_SOURCE")
     baseline = capture(ops, config, archive, expected, paths)
-    # Enforce a practical reserve on the shared filesystem before using the repository.
-    available = shutil.disk_usage(config.backup_root).free
-    require(available >= 1024**3, "INSUFFICIENT_DISK_HEADROOM")
+    available, estimate = require_backup_space(ops, config, baseline[4])
     if options.execute:
         for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
             signal.signal(signum, interrupted)
@@ -364,7 +386,7 @@ def main():
             and account_count(ops, config, user, legacy=True) == 0, "DRY_RUN_STATE_CHANGED")
     print(json.dumps({"mode": "dry-run", "releaseSha": config.release_sha, "operationsArchiveSha256": config.operations_sha256,
                       "destinationAbsent": True, "accountAndClientFileAbsent": True,
-                      "freeBytes": available, "source": baseline[2], "imageFileCounts": list(map(len, baseline[4])),
+                      "freeBytes": available, "estimatedRepositoryBytes": estimate, "source": baseline[2], "imageFileCounts": list(map(len, baseline[4])),
                       "state": "api-inactive-https-503-mysql-healthy-no-other-sessions"}, sort_keys=True))
 
 
