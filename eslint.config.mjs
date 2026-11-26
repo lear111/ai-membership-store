@@ -7,6 +7,7 @@ import prettier from 'eslint-config-prettier'
 export default [
   {
     ignores: [
+      '.local-data/**',
       '**/dist/**',
       'coverage/**',
       'playwright-report/**',

@@ -138,7 +138,57 @@ enum SubscriptionEventType {
   AUTO_TERMINATED
 }
 
+model SupportSettings {
+  id Int @id
+  agentId String? @db.VarChar(36)
+  emailEnabled Boolean @default(false)
+  agent User? @relation(fields: [agentId], references: [id], onDelete: Restrict)
+}
+
+model SupportThread {
+  customerId String @id @db.VarChar(36)
+  agentId String? @db.VarChar(36)
+  pendingAt DateTime?
+  customerRead Int @default(0)
+  agentRead Int @default(0)
+  updatedAt DateTime @updatedAt
+  customer User @relation("ChatCustomer", fields: [customerId], references: [id], onDelete: Restrict)
+  agent User? @relation("ChatAgent", fields: [agentId], references: [id], onDelete: Restrict)
+  messages SupportMessage[]
+  @@index([agentId, updatedAt])
+}
+
+model SupportMessage {
+  id Int @id @default(autoincrement())
+  customerId String @db.VarChar(36)
+  senderId String @db.VarChar(36)
+  fromAgent Boolean
+  requestId String @db.VarChar(36)
+  text String @db.Text
+  audio Bytes? @db.MediumBlob
+  audioType String? @db.VarChar(24)
+  orderId String? @db.VarChar(36)
+  createdAt DateTime @default(now())
+  thread SupportThread @relation(fields: [customerId], references: [customerId], onDelete: Restrict)
+  order Order? @relation(fields: [orderId], references: [id], onDelete: Restrict)
+  @@unique([senderId, requestId])
+  @@index([customerId, id])
+}
+
+model SupportReminder {
+  id Int @id @default(autoincrement())
+  customerId String @db.VarChar(36)
+  agentId String @db.VarChar(36)
+  nextAttempt DateTime @default(now())
+  attempts Int @default(0)
+  deliveredAt DateTime?
+  @@index([deliveredAt, nextAttempt])
+}
+
 model User {
+  supportSettings SupportSettings[]
+  supportCustomers SupportThread[] @relation("ChatCustomer")
+  supportAssignments SupportThread[] @relation("ChatAgent")
   id                String        @id @default(uuid()) @db.VarChar(36)
   username          String?       @db.VarChar(80)
   adminLabel        String?       @db.VarChar(80)
@@ -229,6 +279,7 @@ model Product {
 }
 
 model Order {
+  supportMessages SupportMessage[]
   version                    Int                  @default(1)
   id                         String               @id @default(uuid()) @db.VarChar(36)
   orderNo                    String               @unique @db.VarChar(40)

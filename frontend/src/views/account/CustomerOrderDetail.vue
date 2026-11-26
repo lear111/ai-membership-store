@@ -203,6 +203,9 @@ onMounted(load)
       {{ error }} <ElButton link @click="load">重试详情</ElButton>
     </p>
     <div v-else-if="order" class="customer-order-detail">
+      <RouterLink :to="{ path: '/messages', query: { order: order.id } }"
+        >就此订单联系客服</RouterLink
+      >
       <header class="order-hero">
         <div class="order-hero-main">
           <strong

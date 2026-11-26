@@ -254,7 +254,7 @@ counts() {
 counts "$source_id" >"$root/source-counts"
 counts "$target_id" >"$root/restored-counts"
 diff -u "$root/source-counts" "$root/restored-counts"
-[[ $(wc -l <"$root/source-counts") == 14 ]]
+[[ $(wc -l <"$root/source-counts") == 18 ]]
 diff -r "$root/images" "$restore_images/${root#/}/images"
 printf 'Exact table counts matched across %s tables. Both restored images are byte-identical.\n' "$(wc -l <"$root/source-counts")"
 docker cp "$target_id:/var/lib/mysql/public_key.pem" "$root/target.pem"

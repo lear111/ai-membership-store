@@ -16,7 +16,7 @@ from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import monitor
-from backup import release_migrations, verify_migrations
+from backup import CHAT_MIGRATION, expected_tables, release_migrations, verify_migrations
 from common import Failure
 from retention import retention_plan
 
@@ -39,15 +39,21 @@ class OperationalTests(unittest.TestCase):
     def test_release_history_accepts_previous_archive_and_rejects_mixed_chain(self):
         directory = Path(__file__).resolve().parents[3] / "backend/prisma/migrations"
         current = release_migrations(directory)
-        self.assertEqual(len(current), 15)
+        self.assertEqual(len(current), 16)
+        self.assertEqual(len(expected_tables(current)), 18)
         t25 = "20261124000000_customer_invitation_registration"
         with tempfile.TemporaryDirectory() as root:
             prior = Path(root)
-            for name in current.keys() - {t25}:
+            for name in current.keys() - {t25, CHAT_MIGRATION}:
                 target = prior / name / "migration.sql"
                 target.parent.mkdir()
                 target.write_bytes((directory / name / "migration.sql").read_bytes())
             historical = release_migrations(prior)
+            self.assertEqual(len(expected_tables(historical)), 14)
+            invitation = prior / t25 / "migration.sql"
+            invitation.parent.mkdir()
+            invitation.write_bytes((directory / t25 / "migration.sql").read_bytes())
+            self.assertEqual(len(release_migrations(prior)), 15)
         recorded = [[name, next(iter(checksums))] for name, checksums in historical.items()]
         verify_migrations(recorded, historical)
         with self.assertRaisesRegex(Failure, "MIGRATIONS_NOT_REVIEWED_CHAIN"):

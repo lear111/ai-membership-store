@@ -88,7 +88,8 @@ done
 (
   cd "$test_root/ops"
   sha256sum --check --strict --quiet SHA256SUMS
-  [[ $(find backend/prisma/migrations -name migration.sql -type f | wc -l) == 15 ]]
+  [[ -s backend/prisma/migrations/20261124010000_support_chat/migration.sql ]]
+  [[ $(find backend/prisma/migrations -name migration.sql -type f | wc -l) == 16 ]]
   cd backend
   NODE_ENV=production node scripts/prisma.ts --production validate
   reject env -i PATH="$PATH" NODE_ENV=production node scripts/prisma.ts --production migrate status

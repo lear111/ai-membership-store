@@ -5,9 +5,14 @@ export function isPurchasePath(path: string) {
 export function customerRedirect(path: unknown): string | undefined {
   if (typeof path !== 'string') return
   if (
-    ['/profile', '/orders', '/account/orders', '/subscriptions'].includes(
-      path,
-    ) ||
+    [
+      '/profile',
+      '/orders',
+      '/account/orders',
+      '/subscriptions',
+      '/messages',
+      '/support/inbox',
+    ].includes(path) ||
     isPurchasePath(path)
   )
     return path

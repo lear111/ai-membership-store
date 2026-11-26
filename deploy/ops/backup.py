@@ -33,6 +33,14 @@ TABLES = {
     "InvitationToken", "Order", "OrderEvent", "OrderRevision", "PaymentTransaction",
     "Product", "Session", "Subscription", "SubscriptionEvent", "User",
 }
+CHAT_MIGRATION = "20261124010000_support_chat"
+CHAT_TABLES = {"SupportSettings", "SupportThread", "SupportMessage", "SupportReminder"}
+
+
+def expected_tables(migrations):
+    return TABLES | CHAT_TABLES if CHAT_MIGRATION in migrations else TABLES
+
+
 TRIGGERS = {
     "Order_renewal_immutable_update", "Order_paid_renewal_delete",
     "Order_new_source_insert", "Order_source_immutable_update", "Order_delete_guard",
@@ -102,7 +110,9 @@ def release_migrations(directory):
         raise Failure("OPERATIONS_MIGRATIONS_MISSING") from None
     # A historical restore uses the operations archive for that backup's release.
     t25 = "20261124000000_customer_invitation_registration"
-    expected_count = 15 if t25 in migrations else 14
+    if CHAT_MIGRATION in migrations and t25 not in migrations:
+        raise Failure("OPERATIONS_MIGRATIONS_MISSING")
+    expected_count = 14 + int(t25 in migrations) + int(CHAT_MIGRATION in migrations)
     if len(migrations) != expected_count:
         raise Failure("OPERATIONS_MIGRATIONS_MISSING")
     return migrations
@@ -125,7 +135,7 @@ def inventory(mysql, expected):
     if any(row[0] in {"routines", "events"} or
            (row[0] == "tables" and row[2:4] != ["BASE TABLE", "InnoDB"]) for row in data):
         raise Failure("UNSUPPORTED_DATABASE_OBJECT")
-    if set(tables) != TABLES:
+    if set(tables) != expected_tables(expected):
         raise Failure("DATABASE_SCHEMA_INCOMPLETE")
     migrations = rows(mysql, """
         SELECT JSON_ARRAY(migration_name,checksum,finished_at IS NOT NULL,rolled_back_at IS NULL)
@@ -431,7 +441,7 @@ def restore(repo, run, project, output, migrations_directory):
     recorded = meta["inventory"]
     expected = release_migrations(migrations_directory)
     verify_migrations(recorded["migrations"], expected)
-    if set(recorded["tables"]) != TABLES:
+    if set(recorded["tables"]) != expected_tables(expected):
         raise Failure("DATABASE_SCHEMA_INCOMPLETE")
     definers = {row[0] for row in rows(mysql, "SELECT JSON_ARRAY(CONCAT(User,'@',Host)) FROM mysql.user")}
     if not set(recorded["triggerDefiners"]).issubset(definers):

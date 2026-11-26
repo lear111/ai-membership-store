@@ -868,8 +868,8 @@ try {
       try {
         const versions = await db.$queryRawUnsafe('SELECT COUNT(*) AS n FROM _prisma_migrations WHERE finished_at IS NOT NULL AND rolled_back_at IS NULL');
         const tables = await db.$queryRawUnsafe('SELECT COUNT(*) AS n FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE()');
-        assert.equal(Number(versions[0].n), 15);
-        assert.equal(Number(tables[0].n), 14);
+        assert.equal(Number(versions[0].n), 16);
+        assert.equal(Number(tables[0].n), 18);
         if (await db.user.count() === 0) {
           await db.user.create({ data: { loginEmail: 'model-fixture@example.com', role: 'ADMIN', status: 'DISABLED' } });
           await db.appSettings.create({ data: { id: 1, storeName: 'Isolated model fixture', ownerEmail: 'model-fixture@example.com' } });

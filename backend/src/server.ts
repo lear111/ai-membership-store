@@ -1,4 +1,5 @@
 import { createApp } from './app.ts'
+import { startSupportReminders } from './modules/chat/reminders.ts'
 import {
   parseEnvironment,
   EnvironmentError,
@@ -24,6 +25,7 @@ try {
   )
   let stopExpiry: () => Promise<void> = async () => {}
   let stopOrders: () => Promise<void> = async () => {}
+  let stopSupport: () => Promise<void> = async () => {}
   let shuttingDown = false
   const server = createApp(
     () => checkDatabase(database),
@@ -34,6 +36,7 @@ try {
     operations,
   ).listen(env.API_PORT, '127.0.0.1', () => {
     if (shuttingDown) return
+    stopSupport = startSupportReminders(database, env.APP_BASE_URL)
     stopExpiry = startExpiryScheduler(
       subscriptionService(database).autoTerminate,
       () => {},
@@ -61,6 +64,7 @@ try {
         }),
       () => stopExpiry(),
       () => stopOrders(),
+      () => stopSupport(),
     ],
     () => database.$disconnect(),
   )

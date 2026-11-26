@@ -27,6 +27,17 @@ export const router = createRouter({
       component: StoreLayout,
       children: [
         {
+          path: 'messages',
+          meta: { authenticated: true },
+          component: () => import('../views/chat/Chat.vue'),
+        },
+        {
+          path: 'support/inbox',
+          meta: { authenticated: true },
+          component: () => import('../views/chat/Chat.vue'),
+          props: { agent: true },
+        },
+        {
           path: '',
           name: 'catalog',
           meta: { publicCatalog: true },
@@ -69,6 +80,10 @@ export const router = createRouter({
       meta: { admin: true },
       component: AdminLayout,
       children: [
+        {
+          path: 'support',
+          component: () => import('../views/chat/Settings.vue'),
+        },
         { path: '', component: () => import('../views/admin/Overview.vue') },
         {
           path: 'products',

@@ -97,6 +97,10 @@ const businessPrivileges: Record<string, string> = {
   SubscriptionEvent: 'INSERT',
   AdminAuditLog: 'INSERT',
   AppSettings: 'UPDATE',
+  SupportSettings: 'UPDATE',
+  SupportThread: 'INSERT, UPDATE',
+  SupportMessage: 'INSERT',
+  SupportReminder: 'INSERT, UPDATE, DELETE',
   IdempotencyRecord: 'INSERT',
 }
 const backtick = String.fromCharCode(96)

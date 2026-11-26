@@ -5,6 +5,7 @@ import {
   ReceiptText,
   UserRound,
   ArrowUpRight,
+  MessageCircle,
 } from '@lucide/vue'
 import Brand from '../components/Brand.vue'
 import { auth } from '../stores/auth'
@@ -45,6 +46,7 @@ const nav = [
     short: '订单',
     icon: ReceiptText,
   },
+  { path: '/messages', text: '消息', short: '消息', icon: MessageCircle },
   { path: '/profile', text: '个人中心', short: '我的', icon: UserRound },
 ]
 function currentPage(path: string) {
@@ -93,7 +95,7 @@ function currentPage(path: string) {
       </div>
     </header>
     <main class="store-main store-container">
-      <RouterView />
+      <RouterView :key="$route.path" />
     </main>
     <footer class="store-footer store-container">
       {{ storefront.state.storeName }}

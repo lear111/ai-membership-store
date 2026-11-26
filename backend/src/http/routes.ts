@@ -12,6 +12,7 @@ import * as schemas from '../modules/users/schemas.ts'
 import { settingsService } from '../modules/settings/service.ts'
 import { wechatPaymentRoutes } from '../modules/settings/wechat-routes.ts'
 import { ApiError } from './errors.ts'
+import { supportRoutes } from '../modules/chat/routes.ts'
 import { csrf, rateLimit } from './security.ts'
 import {
   customerPurchaseRoutes,
@@ -89,6 +90,7 @@ export function applicationRoutes(database: PrismaClient, env: Environment) {
   router.get('/auth/me', authenticate, (_request, response) => {
     response.json({ user: response.locals.principal.user })
   })
+  router.use('/chat', authenticate, supportRoutes(database))
   router.post('/auth/logout', async (request, response) => {
     schemas.emptyBody.parse(request.body)
     await auth.logout(

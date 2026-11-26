@@ -6,11 +6,14 @@ export function csrf(appBaseUrl: string): RequestHandler {
   return (request, _response, next) => {
     if (['GET', 'HEAD', 'OPTIONS'].includes(request.method)) return next()
     const upload =
-      request.method === 'PUT' &&
-      (request.path === '/admin/settings/wechat-qr' ||
-        /^\/admin\/products\/[a-fA-F0-9]{8}(?:-[a-fA-F0-9]{4}){3}-[a-fA-F0-9]{12}\/cover-image$/.test(
-          request.path,
-        ))
+      (request.method === 'POST' &&
+        !!request.is('application/octet-stream') &&
+        /^\/chat\/thread\/(me|[0-9a-f-]{36})\/messages$/.test(request.path)) ||
+      (request.method === 'PUT' &&
+        (request.path === '/admin/settings/wechat-qr' ||
+          /^\/admin\/products\/[a-fA-F0-9]{8}(?:-[a-fA-F0-9]{4}){3}-[a-fA-F0-9]{12}\/cover-image$/.test(
+            request.path,
+          )))
     if (
       request.get('origin') !== origin ||
       request.get('x-requested-with') !== 'MembershipStore' ||

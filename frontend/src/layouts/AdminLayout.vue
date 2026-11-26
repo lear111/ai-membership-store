@@ -23,6 +23,7 @@ const persistentPage = computed(() =>
     '/admin/users',
     '/admin/products',
     '/admin/settings',
+    '/admin/support',
     '/admin/subscriptions',
   ].includes(route.path),
 )
@@ -44,6 +45,7 @@ const nav = [
   { path: '/admin/subscriptions', text: '订阅管理', icon: CalendarDays },
   { path: '/admin/users', text: '用户管理', icon: UsersRound },
   { path: '/admin/settings', text: '系统设置', icon: Settings2 },
+  { path: '/admin/support', text: '客服设置', icon: UsersRound },
 ]
 </script>
 <template>
