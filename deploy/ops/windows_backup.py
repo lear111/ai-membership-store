@@ -4,6 +4,7 @@ import base64
 from dataclasses import dataclass
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import shlex
@@ -202,4 +203,11 @@ def local_windows_repository(path):
             or path.resolve(strict=True) != path or not path.is_dir()
             or not (path / "config").is_file() or (path / "config").is_symlink()):
         raise Failure("WINDOWS_LOCAL_REPOSITORY_PATH")
+    if not os.statvfs(path).f_flag & os.ST_RDONLY:
+        raise Failure("WINDOWS_LOCAL_REPOSITORY_READ_ONLY")
+    for line in Path("/proc/self/mountinfo").read_text().splitlines():
+        fields = line.split()
+        mount = Path(re.sub(r"\\([0-7]{3})", lambda match: chr(int(match[1], 8)), fields[4]))
+        if mount != path and mount.is_relative_to(path) and "ro" not in fields[5].split(","):
+            raise Failure("WINDOWS_LOCAL_REPOSITORY_READ_ONLY")
     return str(path)

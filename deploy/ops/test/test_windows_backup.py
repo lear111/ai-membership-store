@@ -8,6 +8,7 @@ import socket
 import sys
 import tarfile
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
@@ -19,6 +20,22 @@ from windows_backup import WindowsTunnel, local_windows_repository, verified_ope
 
 MIGRATIONS = Path(__file__).resolve().parents[3] / "backend/prisma/migrations"
 T25 = "20261124000000_customer_invitation_registration"
+
+
+def stopped_state():
+    return {
+        "Id": backup.API_UNIT, "LoadState": "loaded", "ActiveState": "inactive", "SubState": "dead",
+        "Result": "success", "MainPID": "0", "ControlPID": "0", "ExecMainCode": "1",
+        "ExecMainStatus": "0", "Slice": "system.slice",
+        "WorkingDirectory": str(backup.RELEASE_ROOT / "current/backend"),
+        "ExecMainStartTimestampMonotonic": "10", "ExecMainExitTimestampMonotonic": "20",
+        "InactiveEnterTimestampMonotonic": "21", "InactiveExitTimestampMonotonic": "9",
+        "ControlGroup": "", "InvocationID": "", "NRestarts": "0",
+    }
+
+
+def systemd_output(values):
+    return "".join(f"{key}={value}\n" for key, value in values.items()).encode()
 
 
 def make_archive(path, count, sha, *, corrupt=False):
@@ -101,6 +118,7 @@ class WindowsBackupTests(unittest.TestCase):
             (["--windows-local-repository", "/repo", "backup"], "WINDOWS_OPERATION_FORBIDDEN"),
             (["--windows-local-repository", "/repo", "restore"], "OPERATIONS_ARCHIVE_ARGUMENT"),
             (["--operations-archive", "/archive", "backup"], "OPERATIONS_ARCHIVE_ARGUMENT"),
+            (["--pre-migration", "backup"], "MAINTENANCE_WINDOWS_BACKUP_REQUIRED"),
         )
         for args, error in combinations:
             with (self.subTest(args=args), patch.object(sys, "argv", ["backup.py", *args]),
@@ -121,11 +139,86 @@ class WindowsBackupTests(unittest.TestCase):
             with self.assertRaisesRegex(Failure, "WINDOWS_LOCAL_REPOSITORY_PATH"):
                 local_windows_repository(repository)
             (repository / "config").touch()
-            self.assertEqual(local_windows_repository(repository), str(repository))
+            with self.assertRaisesRegex(Failure, "WINDOWS_LOCAL_REPOSITORY_READ_ONLY"):
+                local_windows_repository(repository)
+            with patch("windows_backup.os.statvfs", return_value=SimpleNamespace(f_flag=os.ST_RDONLY)):
+                self.assertEqual(local_windows_repository(repository), str(repository))
             symlink = Path(tmp) / ("membership-" + "2" * 32)
             symlink.symlink_to(repository, target_is_directory=True)
             with self.assertRaisesRegex(Failure, "WINDOWS_LOCAL_REPOSITORY_PATH"):
                 local_windows_repository(symlink)
+
+    def test_restore_rejects_output_under_repository_before_docker_access(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repository = Path(tmp) / "repository"
+            directory = repository / "subdir"
+            directory.mkdir(parents=True)
+            repo = SimpleNamespace(local_repository=repository)
+            project = "membership-restore-" + "1" * 12
+            with patch.object(backup, "inspect_target") as inspect:
+                with self.assertRaisesRegex(Failure, "RESTORE_OUTPUT_INSIDE_REPOSITORY"):
+                    backup.restore(repo, "2" * 32, project, directory / (project + "-images"))
+                inspect.assert_not_called()
+
+    def test_maintenance_rejects_unclean_or_unknown_systemd_state(self):
+        for update in ({"ActiveState": "active"}, {"ActiveState": "failed"}, {"SubState": "stop-sigterm"},
+                       {"Result": "timeout"}, {"MainPID": "99"}, {"ControlPID": "99"},
+                       {"ExecMainCode": "2"}, {"ExecMainStatus": "1"},
+                       {"ExecMainStartTimestampMonotonic": "0"}):
+            with self.subTest(update=update), patch.object(
+                backup, "command", return_value=systemd_output({**stopped_state(), **update})
+            ):
+                with self.assertRaisesRegex(Failure, "MAINTENANCE_SERVICE_NOT_STOPPED"):
+                    backup.stopped_service()
+        with patch.object(backup, "command", return_value=systemd_output(stopped_state())):
+            self.assertEqual(backup.stopped_service(), stopped_state())
+
+    def test_maintenance_checks_residual_cgroup_and_api_listener(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            release = root / "releases" / ("a" * 40)
+            release.mkdir(parents=True)
+            (root / "current").symlink_to("releases/" + release.name)
+            (root / "cgroup.controllers").touch()
+            group = root / "system.slice" / backup.API_UNIT
+            group.mkdir(parents=True)
+            events = group / "cgroup.events"
+            archive = SimpleNamespace(release_sha=release.name)
+            with (patch.object(backup, "RELEASE_ROOT", root), patch.object(backup, "CGROUP_ROOT", root),
+                  patch.object(backup, "sealed_runtime", return_value="test-seal"),
+                  patch.object(backup, "stopped_service", side_effect=stopped_state),
+                  patch.object(backup, "command", return_value=b"LISTEN 0 128 127.0.0.1:3101 *:*")):
+                events.write_text("populated 1\nfrozen 0\n")
+                with self.assertRaisesRegex(Failure, "MAINTENANCE_SERVICE_CGROUP"):
+                    backup.maintenance_runtime(archive)
+                events.write_text("populated 0\nfrozen 0\n")
+                with self.assertRaisesRegex(Failure, "MAINTENANCE_API_LISTENER"):
+                    backup.maintenance_runtime(archive)
+                (root / "current").unlink()
+                (root / "current").symlink_to("releases/" + "b" * 40)
+                with self.assertRaisesRegex(Failure, "OPERATIONS_RELEASE_MISMATCH"):
+                    backup.maintenance_runtime(archive)
+
+    def test_new_service_lifecycle_after_images_prevents_completion_marker(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp)
+            archive = Mock(release_sha="a" * 40, archive_sha256="c" * 64)
+            repo = Mock()
+            repo.snapshot.return_value = "d" * 64
+            repo.tunnel.fingerprint = "test-pin"
+            inventory = {"tables": list(backup.TABLES), "triggerCount": 10, "migrations": []}
+            after_restart = {**stopped_state(), "ExecMainStartTimestampMonotonic": "100",
+                             "ExecMainExitTimestampMonotonic": "102", "InactiveEnterTimestampMonotonic": "103"}
+            with (patch.object(backup, "maintenance_runtime", side_effect=[stopped_state()] * 3 + [after_restart]),
+                  patch.object(backup, "migration_checksums"),
+                  patch.object(backup, "image_directories", return_value=[state, state]),
+                  patch.object(backup, "private_file", return_value=True), patch.object(backup, "inspect_target"),
+                  patch.object(backup, "inventory", return_value=inventory),
+                  patch.object(backup, "check_image_references"), patch.object(backup, "table_counts", return_value={})):
+                with self.assertRaisesRegex(Failure, "MAINTENANCE_STATE_CHANGED"):
+                    backup.backup(repo, {}, state, None, archive=archive, pre_migration=True)
+            self.assertEqual([args.args[1] for args in repo.snapshot.call_args_list], ["database", "images"])
+            self.assertNotIn("lastSuccessAt", json.loads((state / "windows-backup.json").read_text()))
 
     def test_listener_must_be_one_exact_ipv4_loopback_socket(self):
         tunnel = WindowsTunnel(32100, "/incoming/membership-" + "1" * 32, "", "", Path("/fake-key"))

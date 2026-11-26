@@ -33,11 +33,11 @@ def log(event, **data):
     print(json.dumps({"time": utc(), "event": event, **data}), flush=True)
 
 
-def command(args, error, *, input=None, env=None, timeout=30):
+def command(args, error, *, input=None, env=None, timeout=30, cwd=None):
     try:
         result = subprocess.run(
             args, input=input, stdin=subprocess.DEVNULL if input is None else None,
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env, timeout=timeout, check=False,
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env, timeout=timeout, check=False, cwd=cwd,
         )
     except (OSError, subprocess.TimeoutExpired):
         raise Failure(error) from None

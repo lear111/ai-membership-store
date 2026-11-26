@@ -10,6 +10,7 @@ from pathlib import Path
 import re
 import shutil
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -26,6 +27,10 @@ from windows_backup import WindowsTunnel, local_windows_repository, verified_ope
 
 
 PROJECT = "ai-membership-store-production"
+RELEASE_ROOT = Path("/opt/ai-membership-store")
+API_UNIT = "ai-membership-store.service"
+API_PORT = 3101
+CGROUP_ROOT = Path("/sys/fs/cgroup")
 TAG = "membership-store"
 RUN = re.compile(r"[0-9a-f]{32}")
 RESTORE_PROJECT = re.compile(r"membership-restore-[0-9a-f]{12}")
@@ -184,6 +189,7 @@ class Repository:
         }
         self.args = [str(binary), "--no-cache"]
         self.tunnel = tunnel
+        self.local_repository = local_repository
         if tunnel is not None:
             self.set_explicit_location(location, tunnel.location)
             self.sftp, transport = tunnel.configure(staging, self.env)
@@ -320,16 +326,109 @@ def operations_root(fixture):
 
 
 def matching_runtime(archive):
-    current = Path("/opt/ai-membership-store/current")
+    current = RELEASE_ROOT / "current"
     runtime = read_json(current / "release.json", {})
     if (runtime.get("kind"), runtime.get("gitSha")) != ("runtime", archive.release_sha):
         raise Failure("OPERATIONS_RELEASE_MISMATCH")
-    pid = command(["systemctl", "show", "ai-membership-store.service", "--property=MainPID", "--value"],
+    pid = command(["systemctl", "show", API_UNIT, "--property=MainPID", "--value"],
                   "RUNNING_RELEASE_IDENTITY").decode().strip()
     if (not re.fullmatch(r"[1-9][0-9]*", pid)
             or Path("/proc", pid, "cwd").resolve() != current.resolve(strict=True) / "backend"):
         raise Failure("RUNNING_RELEASE_IDENTITY")
     return runtime
+
+
+def stopped_service():
+    required = {
+        "Id": API_UNIT, "LoadState": "loaded", "ActiveState": "inactive", "SubState": "dead",
+        "Result": "success", "MainPID": "0", "ControlPID": "0", "ExecMainCode": "1",
+        "ExecMainStatus": "0", "Slice": "system.slice",
+        "WorkingDirectory": str(RELEASE_ROOT / "current/backend"),
+    }
+    timestamps = ("ExecMainStartTimestampMonotonic", "ExecMainExitTimestampMonotonic",
+                  "InactiveEnterTimestampMonotonic", "InactiveExitTimestampMonotonic")
+    properties = (*required, *timestamps, "ControlGroup", "InvocationID", "NRestarts")
+    output = command(["systemctl", "show", API_UNIT, "--all",
+                      "--property=" + ",".join(properties)], "MAINTENANCE_SERVICE_STATE")
+    state = dict(line.split("=", 1) for line in output.decode().splitlines() if "=" in line)
+    if (not set(properties).issubset(state)
+            or any(state[key] != value for key, value in required.items())
+            or any(not re.fullmatch(r"[1-9][0-9]*", state[key]) for key in timestamps)
+            or not int(state[timestamps[0]]) <= int(state[timestamps[1]]) <= int(state[timestamps[2]])):
+        raise Failure("MAINTENANCE_SERVICE_NOT_STOPPED")
+    return state
+
+
+def sealed_runtime(target, sha):
+    # The release installer seals the tree and verifies this same checksum list.
+    manifest, checksums = target / "release.json", target / "SHA256SUMS"
+    for path in (target, manifest, checksums):
+        attributes = path.lstat()
+        if (attributes.st_uid != 0 or attributes.st_gid != 0
+                or attributes.st_mode & 0o222 or path.is_symlink()
+                or (path != target and not stat.S_ISREG(attributes.st_mode))):
+            raise Failure("MAINTENANCE_RUNTIME_NOT_IMMUTABLE")
+    runtime = read_json(manifest, {})
+    if (runtime.get("kind"), runtime.get("gitSha"), runtime.get("checksums")) != (
+        "runtime", sha, "SHA256SUMS"
+    ):
+        raise Failure("OPERATIONS_RELEASE_MISMATCH")
+    contents = checksums.read_bytes()
+    checked = {}
+    for line in contents.decode().splitlines():
+        match = re.fullmatch(r"([0-9a-f]{64})  \./([^\r\n\\]+)", line)
+        if not match or any(part in ("", ".", "..") for part in match[2].split("/")):
+            raise Failure("MAINTENANCE_RUNTIME_CHECKSUM")
+        checked[match[2]] = match[1]
+    actual = set()
+    for path in target.rglob("*"):
+        attributes = path.lstat()
+        if (attributes.st_uid != 0 or attributes.st_gid != 0
+                or (not path.is_symlink() and attributes.st_mode & 0o222)):
+            raise Failure("MAINTENANCE_RUNTIME_NOT_IMMUTABLE")
+        if stat.S_ISREG(attributes.st_mode) and path != checksums:
+            actual.add(path.relative_to(target).as_posix())
+    if (set(checked) != actual
+            or not {"release.json", "backend/dist/server.js", "frontend/dist/index.html"}.issubset(actual)):
+        raise Failure("MAINTENANCE_RUNTIME_CHECKSUM")
+    command(["sha256sum", "--check", "--strict", "--status", str(checksums)],
+            "MAINTENANCE_RUNTIME_CHECKSUM", cwd=target, timeout=120)
+    return hashlib.sha256(contents).hexdigest()
+
+
+def link_identity(path):
+    info = path.lstat()
+    return info.st_dev, info.st_ino, info.st_ctime_ns
+
+
+def maintenance_runtime(archive):
+    before = stopped_service()
+    current = RELEASE_ROOT / "current"
+    target = RELEASE_ROOT / "releases" / archive.release_sha
+    link = link_identity(current)
+    if (not current.is_symlink() or os.readlink(current) != f"releases/{archive.release_sha}"
+            or target.resolve(strict=True) != target or not target.is_dir()):
+        raise Failure("OPERATIONS_RELEASE_MISMATCH")
+    digest = sealed_runtime(target, archive.release_sha)
+    group = "/system.slice/" + API_UNIT
+    if before["ControlGroup"] not in ("", group) or not (CGROUP_ROOT / "cgroup.controllers").is_file():
+        raise Failure("MAINTENANCE_SERVICE_CGROUP")
+    directory = CGROUP_ROOT / group.lstrip("/")
+    try:
+        events = (directory / "cgroup.events").read_text().splitlines()
+    except FileNotFoundError:
+        if directory.exists():
+            raise Failure("MAINTENANCE_SERVICE_CGROUP") from None
+    else:
+        if [line for line in events if line.startswith("populated ")] != ["populated 0"]:
+            raise Failure("MAINTENANCE_SERVICE_CGROUP")
+    if command(["ss", "-H", "-ltn", f"sport = :{API_PORT}"], "MAINTENANCE_API_LISTENER").strip():
+        raise Failure("MAINTENANCE_API_LISTENER")
+    if stopped_service() != before or link_identity(current) != link:
+        raise Failure("MAINTENANCE_STATE_CHANGED")
+    # Include lifecycle timestamps and the link inode so a restart or a switch
+    # away and back is detectable even if the next sample is again inactive.
+    return before, link, digest
 
 
 def windows_release_evidence(archive):
@@ -346,12 +445,13 @@ def table_counts(mysql):
     return dict(rows(mysql, " UNION ALL ".join(statements)))
 
 
-def backup(repo, settings, state, fixture, *, archive=None):
+def backup(repo, settings, state, fixture, *, archive=None, pre_migration=False):
     status_path = state / ("windows-backup.json" if archive is not None else "backup.json")
     old = read_json(status_path, {})
     started = time.monotonic()
     started_at = utc()
     run = uuid4().hex
+    runtime_check = maintenance_runtime if pre_migration else matching_runtime
     try:
         root = fixture / "images" if fixture else IMAGE_ROOT
         # Confirm local headroom before starting remote operations. No SQL is staged.
@@ -359,7 +459,7 @@ def backup(repo, settings, state, fixture, *, archive=None):
             raise Failure("LOCAL_SPACE_LOW")
         paths = image_directories(root)
         if archive is not None:
-            runtime = matching_runtime(archive)
+            runtime = runtime_check(archive)
             sha = archive.release_sha
             expected = migration_checksums(archive.migrations)
             evidence = windows_release_evidence(archive)
@@ -392,14 +492,18 @@ def backup(repo, settings, state, fixture, *, archive=None):
         if archive is not None:
             counts = table_counts(mysql)
             repo.initialize_windows()
+            if pre_migration and runtime_check(archive) != runtime:
+                raise Failure("MAINTENANCE_STATE_CHANGED")
         database_started_at = utc()
         database = repo.snapshot(run, "database", "--stdin-from-command", "--stdin-filename", "database.sql",
                                  "--", *client, "mysqldump", *options, *DUMP)
+        if pre_migration and runtime_check(archive) != runtime:
+            raise Failure("MAINTENANCE_STATE_CHANGED")
         images = repo.snapshot(run, "images", "--one-file-system", "--", *map(str, paths))
         if inventory(mysql, expected) != before:
             raise Failure("DATABASE_OR_RELEASE_CHANGED")
         if archive is not None:
-            if matching_runtime(archive) != runtime or table_counts(mysql) != counts:
+            if (not pre_migration and runtime_check(archive) != runtime) or table_counts(mysql) != counts:
                 raise Failure("DATABASE_OR_RELEASE_CHANGED")
         elif (release_sha(fixture) != sha or read_json(operations / "release.json", {}) != operations_manifest
               or release_migrations(operations / "backend/prisma/migrations") != expected):
@@ -412,11 +516,14 @@ def backup(repo, settings, state, fixture, *, archive=None):
         }
         if archive is not None:
             manifest["windowsBackup"] = {**evidence, "tableCounts": counts,
+                                         "mode": "pre-migration" if pre_migration else "running",
                                          "hostKeyFingerprint": repo.tunnel.fingerprint}
         # A private, small metadata file only. The SQL stream never lands here.
         with tempfile.TemporaryDirectory(dir=state) as staging:
             file = Path(staging) / "manifest.json"
             write_json(file, manifest)
+            if pre_migration and runtime_check(archive) != runtime:
+                raise Failure("MAINTENANCE_STATE_CHANGED")
             marker = repo.snapshot(run, "manifest", "--stdin-from-command", "--stdin-filename",
                                    "manifest.json", "--", "cat", str(file))
         write_json(status_path, {"lastSuccessAt": completed, "lastAttemptAt": completed,
@@ -490,6 +597,12 @@ def restore(repo, run, project, output, migrations_directory=None, *, archive=No
     if (not output.is_absolute() or output.parent.resolve(strict=True) != output.parent
             or not output.name.startswith(project) or output.exists() or output.is_symlink()):
         raise Failure("RESTORE_OUTPUT_MUST_BE_NEW")
+    if repo.local_repository is not None:
+        if any(parent.samefile(repo.local_repository) for parent in output.parents):
+            raise Failure("RESTORE_OUTPUT_INSIDE_REPOSITORY")
+        parent = output.parent.stat()
+        if parent.st_uid != 0 or parent.st_gid != 0 or stat.S_IMODE(parent.st_mode) != 0o700:
+            raise Failure("RESTORE_OUTPUT_PARENT_NOT_PRIVATE")
     target = inspect_target(project, restore=True)
     mysql = ["docker", "exec", "-i", target, "mysql", "--defaults-file=/run/secrets/restore-client",
              "--protocol=SOCKET", "--batch", "--raw", "--skip-column-names", DATABASE]
@@ -574,6 +687,8 @@ def run_tool():
     parser.add_argument("--operations-archive", type=Path,
                         help="Original operations .tar.gz for the runtime being backed up or restored")
     parser.add_argument("--operations-sha256", help="Independently verified SHA-256 of the original operations archive")
+    parser.add_argument("--pre-migration", action="store_true",
+                        help="Require a cleanly stopped API and workers for a one-off Windows backup")
     parser.add_argument("operation", choices=("init", "backup", "check", "check-data", "plan-retention",
                                                 "apply-retention", "plan-prune", "prune", "inspect", "restore"))
     parser.add_argument("--run", default="")
@@ -581,6 +696,8 @@ def run_tool():
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     windows = args.windows_tunnel_profile or args.windows_local_repository
+    if args.pre_migration and not args.windows_tunnel_profile:
+        raise Failure("MAINTENANCE_WINDOWS_BACKUP_REQUIRED")
     if ((args.windows_tunnel_profile and args.operation != "backup")
             or (args.windows_local_repository and args.operation != "restore")):
         raise Failure("WINDOWS_OPERATION_FORBIDDEN")
@@ -610,7 +727,7 @@ def run_tool():
                 repo.call("init", error="REPOSITORY_INIT_FAILED")
                 log("repository_initialized")
             case "backup":
-                backup(repo, settings, state, fixture, archive=archive)
+                backup(repo, settings, state, fixture, archive=archive, pre_migration=args.pre_migration)
             case "restore":
                 if args.output is None:
                     raise Failure("RESTORE_OUTPUT_REQUIRED")

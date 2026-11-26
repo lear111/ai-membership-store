@@ -224,7 +224,7 @@ operate backup
 run1=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["run"])' "$root/state/backup.json")
 if [[ -n ${T273_WINDOWS_INCOMING:-} ]]; then
   python3 -B "$driver/test/windows_rehearsal.py" "$root" "$archive" \
-    "$T273_RUNTIME_MANIFEST" "$T273_WINDOWS_INCOMING"
+    "$T273_RUNTIME_ARCHIVE" "$T273_WINDOWS_INCOMING"
   mapfile -t windows < <(python3 -c '
 import json, sys
 data = json.load(open(sys.argv[1]))
@@ -259,9 +259,35 @@ sql "$target_id" <<'SQL'
 GRANT SELECT ON `membership\_production`.* TO 'fixture_migrate'@'127.0.0.1';
 SQL
 if [[ -n ${T273_WINDOWS_INCOMING:-} ]]; then
-  env -u RESTIC_REPOSITORY python3 -B "$driver/backup.py" restore \
-    --windows-local-repository "${windows[0]}" --operations-archive "$archive" \
-    --operations-sha256 "${windows[2]}" --run "${windows[1]}" --project "$target" --output "$restore_images"
+  directory=$(basename -- "${windows[0]}")
+  [[ $directory =~ ^membership-[0-9a-f]{32}$ && ${windows[0]} == "$T273_WINDOWS_INCOMING/$directory" ]]
+  incoming_mount=$(docker inspect --format '{{range .Mounts}}{{if eq .Destination "/t273-sftp/incoming"}}{{.Source}}{{end}}{{end}}' \
+    "$T273_WINDOWS_RUNNER")
+  [[ $incoming_mount == /* ]]
+  mkdir "$root/windows-driver"
+  cp -- "$driver/"{backup,common,windows_backup}.py "$root/windows-driver/"
+  install -m 0400 "$archive" "$root/windows-operations.tar.gz"
+  # A separate runner sees only the encrypted repository, mounted read-only.
+  # Its outputs and the disposable MySQL volume are separate from that mount.
+  windows_restore=(docker run --rm --pull never --network none
+    --mount "type=bind,source=$incoming_mount/$directory,target=/saved/$directory,readonly"
+    --mount "type=bind,source=$root,target=$root"
+    --mount "type=bind,source=$root/restic,target=/opt/restic-0.20.0/restic,readonly"
+    --mount 'type=bind,source=/var/run/docker.sock,target=/var/run/docker.sock'
+    --env "RESTIC_PASSWORD_FILE=$RESTIC_PASSWORD_FILE"
+    "$T273_WINDOWS_TEST_IMAGE" python3 -B "$root/windows-driver/backup.py" restore
+    --windows-local-repository "/saved/$directory" --operations-archive "$root/windows-operations.tar.gz"
+    --operations-sha256 "${windows[2]}" --run "${windows[1]}" --project "$target")
+  repository_sums() {
+    (cd "${windows[0]}" && find . -type f -print0 | sort -z | xargs -0 sha256sum)
+  }
+  repository_sums >"$root/repository-before"
+  expected_failure RESTORE_OUTPUT_INSIDE_REPOSITORY "${windows_restore[@]}" \
+    --output "/saved/$directory/$target-images"
+  "${windows_restore[@]}" --output "$restore_images"
+  repository_sums >"$root/repository-after"
+  cmp "$root/repository-before" "$root/repository-after"
+  echo 'Read-only Windows repository mount restored successfully and all repository file digests were preserved.'
 else
   operate restore --run "$run1" --project "$target" --output "$restore_images"
 fi
