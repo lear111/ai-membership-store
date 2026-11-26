@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+from contextlib import nullcontext
 import datetime as dt
 import hashlib
 import ipaddress
@@ -9,8 +10,10 @@ from pathlib import Path
 import re
 import shutil
 import socket
+import stat
 import subprocess
 import sys
+import tempfile
 import time
 from urllib.parse import urlsplit
 from uuid import uuid4
@@ -20,9 +23,14 @@ from common import (
     Failure, command, configuration, docker, inspect, lock, log, private_file,
     read_json, utc, write_json,
 )
+from windows_backup import WindowsTunnel, local_windows_repository, verified_operations
 
 
 PROJECT = "ai-membership-store-production"
+RELEASE_ROOT = Path("/opt/ai-membership-store")
+API_UNIT = "ai-membership-store.service"
+API_PORT = 3101
+CGROUP_ROOT = Path("/sys/fs/cgroup")
 TAG = "membership-store"
 RUN = re.compile(r"[0-9a-f]{32}")
 RESTORE_PROJECT = re.compile(r"membership-restore-[0-9a-f]{12}")
@@ -87,24 +95,27 @@ def rows(mysql, sql):
 
 
 def release_migrations(directory):
-    migrations = {}
     try:
-        for entry in directory.iterdir():
-            if not entry.is_dir():
-                continue
-            sql = (entry / "migration.sql").read_bytes()
-            lf = sql.replace(b"\r\n", b"\n")
-            # Match T23.1 bootstrap: exact, LF and CRLF SHA-256.
-            migrations[entry.name] = {
-                hashlib.sha256(text).hexdigest() for text in (sql, lf, lf.replace(b"\n", b"\r\n"))
-            }
+        return migration_checksums({
+            entry.name: (entry / "migration.sql").read_bytes()
+            for entry in directory.iterdir() if entry.is_dir()
+        })
     except OSError:
         raise Failure("OPERATIONS_MIGRATIONS_MISSING") from None
+
+
+def migration_checksums(scripts):
     # A historical restore uses the operations archive for that backup's release.
     t25 = "20261124000000_customer_invitation_registration"
-    expected_count = 15 if t25 in migrations else 14
-    if len(migrations) != expected_count:
+    if len(scripts) != (15 if t25 in scripts else 14):
         raise Failure("OPERATIONS_MIGRATIONS_MISSING")
+    migrations = {}
+    for name, sql in scripts.items():
+        lf = sql.replace(b"\r\n", b"\n")
+        # Match T23.1 bootstrap: exact, LF and CRLF SHA-256.
+        migrations[name] = {
+            hashlib.sha256(text).hexdigest() for text in (sql, lf, lf.replace(b"\n", b"\r\n"))
+        }
     return migrations
 
 
@@ -163,7 +174,7 @@ def assert_off_host(host):
 
 
 class Repository:
-    def __init__(self, fixture):
+    def __init__(self, fixture, *, tunnel=None, staging=None, local_repository=None):
         location = os.environ.get("RESTIC_REPOSITORY", "")
         password = os.environ.get("RESTIC_PASSWORD_FILE", "")
         if not private_file(password):
@@ -177,7 +188,17 @@ class Repository:
             "AWS_EC2_METADATA_DISABLED": "true",
         }
         self.args = [str(binary), "--no-cache"]
-        if fixture is not None:
+        self.tunnel = tunnel
+        self.local_repository = local_repository
+        if tunnel is not None:
+            self.set_explicit_location(location, tunnel.location)
+            self.sftp, transport = tunnel.configure(staging, self.env)
+            self.args += ["-o", transport]
+        elif local_repository is not None:
+            self.set_explicit_location(location, local_windows_repository(local_repository))
+            # Reading a saved repository must not leave lock files on Windows.
+            self.args += ["--no-lock"]
+        elif fixture is not None:
             if location != str(fixture / "repo"):
                 raise Failure("FIXTURE_REPOSITORY_REQUIRED")
             # Fixture-only command shims are used for failure injection.
@@ -212,12 +233,27 @@ class Repository:
         if not re.match(rb"^restic 0\.20\.0(?:\s|$)", self.call("version")):
             raise Failure("RESTIC_VERSION")
 
+    def set_explicit_location(self, inherited, selected):
+        if inherited and inherited != selected:
+            raise Failure("WINDOWS_REPOSITORY_ENV_MISMATCH")
+        self.env["RESTIC_REPOSITORY"] = selected
+
+    def initialize_windows(self):
+        self.tunnel.verify_listener()
+        # mkdir fails if the dedicated directory already exists; never reuse an old run.
+        command(self.sftp, "WINDOWS_REPOSITORY_NOT_NEW",
+                input=f"mkdir {self.tunnel.directory}\n".encode("ascii"), env=self.env)
+        self.call("init", error="REPOSITORY_INIT_FAILED")
+
     def call(self, *args, error="RESTIC_OPERATION", timeout=3600):
+        if self.tunnel is not None and args != ("version",):
+            self.tunnel.verify_listener()
         return command([*self.args, *args], error, env=self.env, timeout=timeout)
 
-    def snapshot(self, run, part, *args):
+    def snapshot(self, run, part, *args, staged=False):
+        tags = [] if staged else ["--tag", TAG]
         output = self.call(
-            "--json", "backup", "--tag", TAG, "--tag", "run:" + run, "--tag", part,
+            "--json", "backup", *tags, "--tag", "run:" + run, "--tag", part,
             *args, error="BACKUP_" + part.upper(),
         )
         ids = [item.get("snapshot_id", "") for line in output.splitlines()
@@ -225,6 +261,17 @@ class Repository:
         if len(ids) != 1 or not SNAPSHOT.fullmatch(ids[0]):
             raise Failure("SNAPSHOT_ID_MISSING")
         return ids[0]
+
+    def publish_manifest(self, snapshot_id):
+        if not SNAPSHOT.fullmatch(snapshot_id):
+            raise Failure("SNAPSHOT_ID_MISSING")
+        output = self.call("--json", "tag", "--add", TAG, snapshot_id, error="BACKUP_MANIFEST_PUBLISH")
+        changes = [item for line in output.splitlines()
+                   if (item := json.loads(line)).get("message_type") == "changed"]
+        if (len(changes) != 1 or changes[0].get("old_snapshot_id") != snapshot_id
+                or not SNAPSHOT.fullmatch(changes[0].get("new_snapshot_id", ""))):
+            raise Failure("BACKUP_MANIFEST_PUBLISH")
+        return changes[0]["new_snapshot_id"]
 
     def snapshots(self):
         return json.loads(self.call("--json", "snapshots", "--tag", TAG, timeout=60))
@@ -290,24 +337,151 @@ def operations_root(fixture):
     return fixture / "app" if fixture else HERE.parents[1]
 
 
-def backup(repo, settings, state, fixture):
-    status_path = state / "backup.json"
+def matching_runtime(archive):
+    current = RELEASE_ROOT / "current"
+    runtime = read_json(current / "release.json", {})
+    if (runtime.get("kind"), runtime.get("gitSha")) != ("runtime", archive.release_sha):
+        raise Failure("OPERATIONS_RELEASE_MISMATCH")
+    pid = command(["systemctl", "show", API_UNIT, "--property=MainPID", "--value"],
+                  "RUNNING_RELEASE_IDENTITY").decode().strip()
+    if (not re.fullmatch(r"[1-9][0-9]*", pid)
+            or Path("/proc", pid, "cwd").resolve() != current.resolve(strict=True) / "backend"):
+        raise Failure("RUNNING_RELEASE_IDENTITY")
+    return runtime
+
+
+def stopped_service():
+    required = {
+        "Id": API_UNIT, "LoadState": "loaded", "ActiveState": "inactive", "SubState": "dead",
+        "Result": "success", "MainPID": "0", "ControlPID": "0", "ExecMainCode": "1",
+        "ExecMainStatus": "0", "Slice": "system.slice",
+        "WorkingDirectory": str(RELEASE_ROOT / "current/backend"),
+    }
+    timestamps = ("ExecMainStartTimestampMonotonic", "ExecMainExitTimestampMonotonic",
+                  "InactiveEnterTimestampMonotonic", "InactiveExitTimestampMonotonic")
+    properties = (*required, *timestamps, "ControlGroup", "InvocationID", "NRestarts")
+    output = command(["systemctl", "show", API_UNIT, "--all",
+                      "--property=" + ",".join(properties)], "MAINTENANCE_SERVICE_STATE")
+    state = dict(line.split("=", 1) for line in output.decode().splitlines() if "=" in line)
+    if (not set(properties).issubset(state)
+            or any(state[key] != value for key, value in required.items())
+            or any(not re.fullmatch(r"[1-9][0-9]*", state[key]) for key in timestamps)
+            or not int(state[timestamps[0]]) <= int(state[timestamps[1]]) <= int(state[timestamps[2]])):
+        raise Failure("MAINTENANCE_SERVICE_NOT_STOPPED")
+    return state
+
+
+def sealed_runtime(target, sha):
+    # The release installer seals the tree and verifies this same checksum list.
+    manifest, checksums = target / "release.json", target / "SHA256SUMS"
+    for path in (target, manifest, checksums):
+        attributes = path.lstat()
+        if (attributes.st_uid != 0 or attributes.st_gid != 0
+                or attributes.st_mode & 0o222 or path.is_symlink()
+                or (path != target and not stat.S_ISREG(attributes.st_mode))):
+            raise Failure("MAINTENANCE_RUNTIME_NOT_IMMUTABLE")
+    runtime = read_json(manifest, {})
+    if (runtime.get("kind"), runtime.get("gitSha"), runtime.get("checksums")) != (
+        "runtime", sha, "SHA256SUMS"
+    ):
+        raise Failure("OPERATIONS_RELEASE_MISMATCH")
+    contents = checksums.read_bytes()
+    checked = {}
+    for line in contents.decode().splitlines():
+        match = re.fullmatch(r"([0-9a-f]{64})  \./([^\r\n\\]+)", line)
+        if not match or any(part in ("", ".", "..") for part in match[2].split("/")):
+            raise Failure("MAINTENANCE_RUNTIME_CHECKSUM")
+        checked[match[2]] = match[1]
+    actual = set()
+    for path in target.rglob("*"):
+        attributes = path.lstat()
+        if (attributes.st_uid != 0 or attributes.st_gid != 0
+                or (not path.is_symlink() and attributes.st_mode & 0o222)):
+            raise Failure("MAINTENANCE_RUNTIME_NOT_IMMUTABLE")
+        if stat.S_ISREG(attributes.st_mode) and path != checksums:
+            actual.add(path.relative_to(target).as_posix())
+    if (set(checked) != actual
+            or not {"release.json", "backend/dist/server.js", "frontend/dist/index.html"}.issubset(actual)):
+        raise Failure("MAINTENANCE_RUNTIME_CHECKSUM")
+    command(["sha256sum", "--check", "--strict", "--status", str(checksums)],
+            "MAINTENANCE_RUNTIME_CHECKSUM", cwd=target, timeout=120)
+    return hashlib.sha256(contents).hexdigest()
+
+
+def link_identity(path):
+    info = path.lstat()
+    return info.st_dev, info.st_ino, info.st_ctime_ns
+
+
+def maintenance_runtime(archive):
+    before = stopped_service()
+    current = RELEASE_ROOT / "current"
+    target = RELEASE_ROOT / "releases" / archive.release_sha
+    link = link_identity(current)
+    if (not current.is_symlink() or os.readlink(current) != f"releases/{archive.release_sha}"
+            or target.resolve(strict=True) != target or not target.is_dir()):
+        raise Failure("OPERATIONS_RELEASE_MISMATCH")
+    digest = sealed_runtime(target, archive.release_sha)
+    group = "/system.slice/" + API_UNIT
+    if before["ControlGroup"] not in ("", group) or not (CGROUP_ROOT / "cgroup.controllers").is_file():
+        raise Failure("MAINTENANCE_SERVICE_CGROUP")
+    directory = CGROUP_ROOT / group.lstrip("/")
+    try:
+        events = (directory / "cgroup.events").read_text().splitlines()
+    except FileNotFoundError:
+        if directory.exists():
+            raise Failure("MAINTENANCE_SERVICE_CGROUP") from None
+    else:
+        if [line for line in events if line.startswith("populated ")] != ["populated 0"]:
+            raise Failure("MAINTENANCE_SERVICE_CGROUP")
+    if command(["ss", "-H", "-ltn", f"sport = :{API_PORT}"], "MAINTENANCE_API_LISTENER").strip():
+        raise Failure("MAINTENANCE_API_LISTENER")
+    if stopped_service() != before or link_identity(current) != link:
+        raise Failure("MAINTENANCE_STATE_CHANGED")
+    # Include lifecycle timestamps and the link inode so a restart or a switch
+    # away and back is detectable even if the next sample is again inactive.
+    return before, link, digest
+
+
+def windows_release_evidence(archive):
+    driver = {}
+    for name in ("backup.py", "common.py", "windows_backup.py"):
+        with (HERE / name).open("rb") as source:
+            driver[name] = hashlib.file_digest(source, "sha256").hexdigest()
+    return {"operationsArchiveSha256": archive.archive_sha256,
+            "operationsReleaseSha": archive.release_sha, "driverFileSha256": driver}
+
+
+def table_counts(mysql):
+    statements = [f"SELECT JSON_ARRAY('{table}',(SELECT COUNT(*) FROM `{table}`))" for table in sorted(TABLES)]
+    return dict(rows(mysql, " UNION ALL ".join(statements)))
+
+
+def backup(repo, settings, state, fixture, *, archive=None, pre_migration=False):
+    status_path = state / ("windows-backup.json" if archive is not None else "backup.json")
     old = read_json(status_path, {})
     started = time.monotonic()
     started_at = utc()
     run = uuid4().hex
+    runtime_check = maintenance_runtime if pre_migration else matching_runtime
     try:
         root = fixture / "images" if fixture else IMAGE_ROOT
         # Confirm local headroom before starting remote operations. No SQL is staged.
         if min(shutil.disk_usage(path).free for path in (state, root.parent)) < settings.get("minFreeBytes", 268435456):
             raise Failure("LOCAL_SPACE_LOW")
         paths = image_directories(root)
-        sha = release_sha(fixture)
-        operations = operations_root(fixture)
-        operations_manifest = read_json(operations / "release.json", {})
-        if (operations_manifest.get("kind"), operations_manifest.get("gitSha")) != ("operations", sha):
-            raise Failure("OPERATIONS_RELEASE_MISMATCH")
-        expected = release_migrations(operations / "backend/prisma/migrations")
+        if archive is not None:
+            runtime = runtime_check(archive)
+            sha = archive.release_sha
+            expected = migration_checksums(archive.migrations)
+            evidence = windows_release_evidence(archive)
+        else:
+            sha = release_sha(fixture)
+            operations = operations_root(fixture)
+            operations_manifest = read_json(operations / "release.json", {})
+            if (operations_manifest.get("kind"), operations_manifest.get("gitSha")) != ("operations", sha):
+                raise Failure("OPERATIONS_RELEASE_MISMATCH")
+            expected = release_migrations(operations / "backend/prisma/migrations")
         if fixture:
             project = settings.get("fixtureProject", "")
             if not FIXTURE_PROJECT.fullmatch(project):
@@ -327,13 +501,24 @@ def backup(repo, settings, state, fixture):
         mysql = [*client, "mysql", *options, "--batch", "--raw", "--skip-column-names", DATABASE]
         before = inventory(mysql, expected)
         check_image_references(mysql, paths, "BACKUP_IMAGE_REFERENCE")
+        if archive is not None:
+            counts = table_counts(mysql)
+            repo.initialize_windows()
+            if pre_migration and runtime_check(archive) != runtime:
+                raise Failure("MAINTENANCE_STATE_CHANGED")
         database_started_at = utc()
         database = repo.snapshot(run, "database", "--stdin-from-command", "--stdin-filename", "database.sql",
                                  "--", *client, "mysqldump", *options, *DUMP)
+        if pre_migration and runtime_check(archive) != runtime:
+            raise Failure("MAINTENANCE_STATE_CHANGED")
         images = repo.snapshot(run, "images", "--one-file-system", "--", *map(str, paths))
-        if (inventory(mysql, expected) != before or release_sha(fixture) != sha
-                or read_json(operations / "release.json", {}) != operations_manifest
-                or release_migrations(operations / "backend/prisma/migrations") != expected):
+        if inventory(mysql, expected) != before:
+            raise Failure("DATABASE_OR_RELEASE_CHANGED")
+        if archive is not None:
+            if (not pre_migration and runtime_check(archive) != runtime) or table_counts(mysql) != counts:
+                raise Failure("DATABASE_OR_RELEASE_CHANGED")
+        elif (release_sha(fixture) != sha or read_json(operations / "release.json", {}) != operations_manifest
+              or release_migrations(operations / "backend/prisma/migrations") != expected):
             raise Failure("DATABASE_OR_RELEASE_CHANGED")
         completed = utc()
         manifest = {
@@ -341,17 +526,29 @@ def backup(repo, settings, state, fixture):
             "completedAt": completed, "releaseSha": sha, "inventory": before,
             "databaseSnapshot": database, "imagesSnapshot": images, "imagePaths": list(map(str, paths)),
         }
+        if archive is not None:
+            manifest["windowsBackup"] = {**evidence, "tableCounts": counts,
+                                         "mode": "pre-migration" if pre_migration else "running",
+                                         "hostKeyFingerprint": repo.tunnel.fingerprint}
         # A private, small metadata file only. The SQL stream never lands here.
-        import tempfile
         with tempfile.TemporaryDirectory(dir=state) as staging:
             file = Path(staging) / "manifest.json"
             write_json(file, manifest)
+            if pre_migration and runtime_check(archive) != runtime:
+                raise Failure("MAINTENANCE_STATE_CHANGED")
             marker = repo.snapshot(run, "manifest", "--stdin-from-command", "--stdin-filename",
-                                   "manifest.json", "--", "cat", str(file))
+                                   "manifest.json", "--", "cat", str(file), staged=pre_migration)
+            if pre_migration:
+                # An uploaded manifest stays outside the application tag until
+                # its upload is known to have spanned the same stopped runtime.
+                if runtime_check(archive) != runtime:
+                    raise Failure("MAINTENANCE_STATE_CHANGED")
+                marker = repo.publish_manifest(marker)
         write_json(status_path, {"lastSuccessAt": completed, "lastAttemptAt": completed,
                                  "run": run, "manifest": marker, "result": "success"})
         log("backup_completed", run=run, tables=len(before["tables"]), migrations=len(before["migrations"]),
-            triggers=before["triggerCount"], durationSeconds=round(time.monotonic() - started, 3))
+            triggers=before["triggerCount"], durationSeconds=round(time.monotonic() - started, 3),
+            **(evidence if archive is not None else {}))
     except (Failure, OSError, ValueError, TypeError, KeyError) as exc:
         reason = str(exc) if isinstance(exc, Failure) else "BACKUP_INTERNAL"
         write_json(status_path, {**old, "result": "failed", "lastAttemptAt": utc(), "errorCode": reason})
@@ -375,7 +572,7 @@ def groups(repo):
 
 
 def load_manifest(repo, run, parts):
-    if set(parts) != {"database", "images", "manifest"}:
+    if set(parts) != {"database", "images", "manifest"} or TAG not in parts["manifest"].get("tags", []):
         raise Failure("BACKUP_INCOMPLETE")
     meta = json.loads(repo.call("dump", parts["manifest"]["id"], "/manifest.json", timeout=60))
     if (meta.get("format") != 1 or meta.get("run") != run
@@ -412,12 +609,18 @@ def verify_definer_privileges(mysql, definer_tables):
             raise Failure("RESTORE_DEFINER_PRIVILEGES")
 
 
-def restore(repo, run, project, output, migrations_directory):
+def restore(repo, run, project, output, migrations_directory=None, *, archive=None):
     if not RUN.fullmatch(run) or not RESTORE_PROJECT.fullmatch(project):
         raise Failure("RESTORE_TARGET_ARGUMENT")
     if (not output.is_absolute() or output.parent.resolve(strict=True) != output.parent
             or not output.name.startswith(project) or output.exists() or output.is_symlink()):
         raise Failure("RESTORE_OUTPUT_MUST_BE_NEW")
+    if repo.local_repository is not None:
+        if any(parent.samefile(repo.local_repository) for parent in output.parents):
+            raise Failure("RESTORE_OUTPUT_INSIDE_REPOSITORY")
+        parent = output.parent.stat()
+        if parent.st_uid != 0 or parent.st_gid != 0 or stat.S_IMODE(parent.st_mode) != 0o700:
+            raise Failure("RESTORE_OUTPUT_PARENT_NOT_PRIVATE")
     target = inspect_target(project, restore=True)
     mysql = ["docker", "exec", "-i", target, "mysql", "--defaults-file=/run/secrets/restore-client",
              "--protocol=SOCKET", "--batch", "--raw", "--skip-column-names", DATABASE]
@@ -429,7 +632,16 @@ def restore(repo, run, project, output, migrations_directory):
         raise Failure("RESTORE_TARGET_NONEMPTY")
     meta = load_manifest(repo, run, groups(repo).get(run, {}))
     recorded = meta["inventory"]
-    expected = release_migrations(migrations_directory)
+    if archive is None:
+        expected = release_migrations(migrations_directory)
+    else:
+        details = meta.get("windowsBackup", {})
+        counts = details.get("tableCounts", {})
+        if ((meta.get("releaseSha"), details.get("operationsReleaseSha"), details.get("operationsArchiveSha256"))
+                != (archive.release_sha, archive.release_sha, archive.archive_sha256)
+                or set(counts) != TABLES or any(type(value) is not int or value < 0 for value in counts.values())):
+            raise Failure("WINDOWS_RESTORE_MANIFEST")
+        expected = migration_checksums(archive.migrations)
     verify_migrations(recorded["migrations"], expected)
     if set(recorded["tables"]) != TABLES:
         raise Failure("DATABASE_SCHEMA_INCOMPLETE")
@@ -438,6 +650,8 @@ def restore(repo, run, project, output, migrations_directory):
         raise Failure("RESTORE_DEFINERS_MISSING")
     if "triggerDefinerTables" in recorded:
         verify_definer_privileges(mysql, recorded["triggerDefinerTables"])
+    if archive is not None:
+        repo.call("check", "--read-data", error="WINDOWS_REPOSITORY_VERIFY")
     started = time.monotonic()
     output.mkdir(mode=0o700)
     repo.call("restore", meta["imagesSnapshot"], "--target", str(output), "--verify", error="RESTORE_IMAGES")
@@ -469,6 +683,8 @@ def restore(repo, run, project, output, migrations_directory):
         verify_definer_privileges(mysql, restored.pop("triggerDefinerTables"))
     if restored != recorded:
         raise Failure("RESTORE_SCHEMA_MISMATCH")
+    if archive is not None and table_counts(mysql) != counts:
+        raise Failure("RESTORE_TABLE_COUNTS")
     check_image_references(mysql, paths, "RESTORE_IMAGE_REFERENCE")
     log("restore_completed", run=run, tables=len(meta["inventory"]["tables"]),
         migrations=len(meta["inventory"]["migrations"]), triggers=meta["inventory"]["triggerCount"],
@@ -478,13 +694,34 @@ def restore(repo, run, project, output, migrations_directory):
 def run_tool():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=Path, default=CONFIG)
-    parser.add_argument("--fixture", type=Path, help="Disposable synthetic integration fixture only")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--fixture", type=Path, help="Disposable synthetic integration fixture only")
+    mode.add_argument("--windows-tunnel-profile", type=Path,
+                      help="One-off backup only. Root:root 0600 JSON with port, repository and independently pinned hostKey;"
+                           " repository is a new membership-<32 hex> directory, and the sibling windows-tunnel-key"
+                           " file is the dedicated client identity.")
+    mode.add_argument("--windows-local-repository", type=Path,
+                      help="Isolated restore only (Linux/WSL). Absolute path of the saved Windows encrypted repository.")
+    parser.add_argument("--operations-archive", type=Path,
+                        help="Original operations .tar.gz for the runtime being backed up or restored")
+    parser.add_argument("--operations-sha256", help="Independently verified SHA-256 of the original operations archive")
+    parser.add_argument("--pre-migration", action="store_true",
+                        help="Require a cleanly stopped API and workers for a one-off Windows backup")
     parser.add_argument("operation", choices=("init", "backup", "check", "check-data", "plan-retention",
                                                 "apply-retention", "plan-prune", "prune", "inspect", "restore"))
     parser.add_argument("--run", default="")
     parser.add_argument("--project", default="")
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
+    windows = args.windows_tunnel_profile or args.windows_local_repository
+    if args.pre_migration and not args.windows_tunnel_profile:
+        raise Failure("MAINTENANCE_WINDOWS_BACKUP_REQUIRED")
+    if ((args.windows_tunnel_profile and args.operation != "backup")
+            or (args.windows_local_repository and args.operation != "restore")):
+        raise Failure("WINDOWS_OPERATION_FORBIDDEN")
+    if bool(windows) != bool(args.operations_archive and args.operations_sha256) or (
+            not windows and (args.operations_archive or args.operations_sha256)):
+        raise Failure("OPERATIONS_ARCHIVE_ARGUMENT")
     os.umask(0o077)
     if os.geteuid() != 0 or any(os.environ.get(name) for name in ("DOCKER_HOST", "DOCKER_CONTEXT")):
         raise Failure("LOCAL_ROOT_OPERATOR_REQUIRED")
@@ -497,20 +734,23 @@ def run_tool():
                     or fixture.resolve(strict=True) != fixture or args.config != fixture / "ops.json"):
         raise Failure("FIXTURE_PATH_REQUIRED")
     state = fixture / "state" if fixture else STATE
-    settings = configuration(args.config)
-    with lock(state, "repository"):
-        repo = Repository(fixture)
+    settings = {} if args.windows_local_repository else configuration(args.config)
+    archive = verified_operations(args.operations_archive, args.operations_sha256) if windows else None
+    tunnel = WindowsTunnel.from_profile(args.windows_tunnel_profile) if args.windows_tunnel_profile else None
+    with lock(state, "repository"), (tempfile.TemporaryDirectory(dir=state) if tunnel else nullcontext()) as staging:
+        repo = Repository(fixture, tunnel=tunnel, staging=Path(staging) if staging else None,
+                          local_repository=args.windows_local_repository)
         match args.operation:
             case "init":
                 repo.call("init", error="REPOSITORY_INIT_FAILED")
                 log("repository_initialized")
             case "backup":
-                backup(repo, settings, state, fixture)
+                backup(repo, settings, state, fixture, archive=archive, pre_migration=args.pre_migration)
             case "restore":
                 if args.output is None:
                     raise Failure("RESTORE_OUTPUT_REQUIRED")
                 restore(repo, args.run, args.project, args.output,
-                        operations_root(fixture) / "backend/prisma/migrations")
+                        operations_root(fixture) / "backend/prisma/migrations", archive=archive)
             case "inspect":
                 log("backup_manifest", manifest=load_manifest(repo, args.run, groups(repo).get(args.run, {})))
             case _:
