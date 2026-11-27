@@ -2,10 +2,6 @@ import { onUnmounted, ref } from 'vue'
 import type { CustomerOrder } from '../../api/customer-orders'
 import { productFormSchema } from '../../../../backend/src/contracts/product-form'
 import { formDataSchema } from '../../../../backend/src/contracts/form-data'
-import {
-  hasCredentialFields,
-  hasCredentialValues,
-} from '../../../../backend/src/contracts/credential-fields'
 import type { FormData } from '../../api/subscriptions'
 
 export const orderPresets = [
@@ -118,14 +114,9 @@ export function timeline(order: CustomerOrder) {
 
 export function safeFrozenForm(order: CustomerOrder) {
   const schema = productFormSchema.safeParse(order.formSchemaSnapshot)
-  if (
-    !schema.success ||
-    hasCredentialFields(schema.data) ||
-    hasCredentialValues(schema.data)
-  )
-    return null
+  if (!schema.success) return null
   const data = formDataSchema(schema.data).safeParse(order.formData ?? {})
-  if (!data.success || hasCredentialValues(data.data)) return null
+  if (!data.success) return null
   return { schema: schema.data, data: data.data as FormData }
 }
 

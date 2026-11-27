@@ -89,7 +89,11 @@ test('requires local validation and invalidates review when edited', async () =>
   expect(checkout.errors.value).toEqual(['账号标识 · 请填写必填项'])
   checkout.values.value = { account: 'API key: fictional-input-only' }
   checkout.check()
-  expect(checkout.errors.value).toEqual(['账号标识 · 不得填写认证凭证'])
+  expect(checkout.errors.value).toEqual([])
+  expect(checkout.phase.value).toBe('review')
+  expect(checkout.review.value).toEqual({
+    account: 'API key: fictional-input-only',
+  })
   expect(fetch).not.toHaveBeenCalled()
   prepare()
   expect(checkout.phase.value).toBe('review')

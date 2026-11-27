@@ -426,7 +426,7 @@ test('complete frozen-form replacement drops omitted optional data without filli
   )
 })
 
-test('both roles enforce required values, all eight types, options, unknown fields and credential restrictions', async () => {
+test('both roles enforce required values, all eight types, options and unknown fields while accepting credential-like text', async () => {
   const order = await fixture()
   const invalid = [
     { ...original, account: '' },
@@ -439,7 +439,6 @@ test('both roles enforce required values, all eight types, options, unknown fiel
     { ...original, number: '2' },
     { ...original, date: '2027-02-29' },
     { ...original, unknown: 'rejected' },
-    { ...original, account: 'password=never-store' },
     {},
   ]
   for (const role of ['customer', 'admin'] as const)
@@ -449,22 +448,21 @@ test('both roles enforce required values, all eight types, options, unknown fiel
         400,
         'INVALID_INPUT',
       )
-  const secret = await fixture({
-    formSchemaSnapshot: {
-      version: 1,
-      fields: [{ id: 'otp', type: 'text', label: '验证码', required: true }],
-    },
-    formData: {},
-  })
-  await rejected(
-    () =>
-      request('customer', secret.id, {
-        expectedVersion: 1,
-        formData: { otp: 'never-store' },
-      }),
-    400,
-    'INVALID_INPUT',
-  )
+  for (const role of ['customer', 'admin'] as const) {
+    const secret = await fixture({
+      formSchemaSnapshot: {
+        version: 1,
+        fields: [{ id: 'otp', type: 'text', label: '验证码', required: true }],
+      },
+      formData: {},
+    })
+    const accepted = await request(role, secret.id, {
+      expectedVersion: 1,
+      formData: { otp: 'stored-as-is' },
+    })
+    assert.equal(accepted.status, 200, JSON.stringify(accepted.body))
+    assert.deepEqual(accepted.body.order.formData, { otp: 'stored-as-is' })
+  }
   const legacy = await fixture({
     formSchemaSnapshot: Prisma.DbNull,
     formData: Prisma.DbNull,

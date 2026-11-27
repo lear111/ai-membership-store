@@ -134,7 +134,7 @@ function removeOption(index: number, optionIndex: number) {
       >
     </div>
     <p class="muted">
-      仅配置必要的非敏感信息，禁止收集密码、验证码、令牌等秘密。最多 20
+      仅配置交付或联系所需的信息。最多 20
       个字段、每字段 20 个选项，配置上限 64 KiB（UTF-8 字节）。
     </p>
     <p v-if="errors.length" class="form-error" role="alert">

@@ -11,20 +11,13 @@
 
 Collect only information necessary for the selected product.
 
-MVP may support non-sensitive identifiers and contact details:
-- Customer contact email.
-- Target account email or account identifier.
-- Product-specific non-sensitive text/selection fields.
+MVP may collect any product-specific form fields the merchant needs to deliver the service, including customer contact email, target account identifiers and text/selection fields, and fields the supplier labels as passwords, verification codes, tokens or API keys. The 2026-11-27 [credential-policy decision](38-service-form-credential-policy.md) removed the former regex-based prohibition; order values are now stored as ordinary plain text.
 
-MVP must not collect or email:
-- Account passwords.
-- One-time passwords or SMS verification codes.
-- 2FA secrets or backup codes.
-- Recovery codes.
-- Session cookies or access tokens.
-- Payment card numbers, security codes, or banking credentials.
-
-If supplier says one of these secrets is required, do not add a generic form field. Pause and design a separate, explicitly authorized secure workflow with the owner. Prefer official user-authorized invitation/OAuth flows that do not disclose credentials to reseller.
+Because order form data and its revision snapshots are not field-level encrypted, treat every collected value as readable by anyone with database, backup or admin order-detail access:
+- Restrict order access by role and verify customer ownership before display.
+- Never log form values, never include them in audit snapshots, and never email them.
+- Never put real values into repository files, `.env.example`, seeds, fixtures or documentation.
+- Collect only what the product delivery requires; if the merchant later needs encrypted storage or masked display, design that separately instead of re-adding a regex block.
 
 ## 2. Email security
 

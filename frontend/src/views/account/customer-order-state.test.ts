@@ -103,11 +103,11 @@ test('timeline has no unconfirmed payment timestamp or invented refund node', ()
   ).toEqual(['订单创建', '实际付款发生', '商家确认收款', '订单取消'])
 })
 
-test('frozen form display and editing reject credential fields, marked values and undeclared properties', () => {
+test('frozen form display and editing reject undeclared properties but keep credential-like labels and values', () => {
   expect(safeFrozenForm(order)?.data).toEqual({ account: 'safe' })
   expect(
-    safeFrozenForm({ ...order, formData: { account: 'OTP: fictional' } }),
-  ).toBeNull()
+    safeFrozenForm({ ...order, formData: { account: 'OTP: fictional' } })?.data,
+  ).toEqual({ account: 'OTP: fictional' })
   expect(
     safeFrozenForm({
       ...order,
@@ -129,6 +129,6 @@ test('frozen form display and editing reject credential fields, marked values an
           },
         ],
       },
-    }),
-  ).toBeNull()
+    })?.schema.fields[0].label,
+  ).toBe('密码')
 })

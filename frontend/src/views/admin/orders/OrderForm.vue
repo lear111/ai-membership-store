@@ -12,7 +12,6 @@ import { OrderRequest, type AdminOrder } from '../../../api/orders'
 import type { FormData } from '../../../api/subscriptions'
 import ProductFormInputs from '../../../components/ProductFormInputs.vue'
 import { productFormSchema } from '../../../../../backend/src/contracts/product-form'
-import { hasCredentialFields } from '../../../../../backend/src/contracts/credential-fields'
 import { parseFormData } from '../../../../../backend/src/contracts/form-data'
 import { formLimitErrorMessage } from '../../../../../backend/src/contracts/form-limits'
 import { money, parsePrice } from '../../../stores/format'
@@ -38,9 +37,7 @@ const schema = computed(() => {
   const parsed = productFormSchema.safeParse(
     props.order?.formSchemaSnapshot ?? product.value?.formSchema,
   )
-  return parsed.success && !hasCredentialFields(parsed.data)
-    ? parsed.data
-    : null
+  return parsed.success ? parsed.data : null
 })
 let customerSequence = 0,
   productSequence = 0
@@ -87,7 +84,7 @@ async function save() {
   error.value = ''
   busy.value = true
   try {
-    if (!schema.value) throw new Error('缺少合法的非敏感表单，不能创建或编辑')
+    if (!schema.value) throw new Error('缺少合法的服务表单，不能创建或编辑')
     const data = parseFormData(schema.value, formData.value),
       amountFen = parsePrice(amount.value)
     const baseline = props.order?.amountFen ?? product.value?.priceFen
@@ -156,9 +153,7 @@ onMounted(() => {
     :show-close="!uncertain && !busy"
     @close="emit('close')"
   >
-    <p class="muted">
-      服务信息仅填写非敏感标识；请勿输入密码、验证码、恢复码或认证凭证。
-    </p>
+    <p class="muted">服务信息按商品表单填写。</p>
     <p v-if="error" role="alert" class="form-error">{{ error }}</p>
     <p v-if="uncertain" role="alert">
       响应未确认。请重试原请求，系统会沿用原幂等密钥。
@@ -210,7 +205,7 @@ onMounted(() => {
           {{ order.version }}
         </p>
         <p v-if="(order || product) && !schema" role="alert" class="form-error">
-          表单未配置、格式不受支持或包含认证凭证字段；请停止填写，先确认表单安全设计。
+          表单未配置或格式不受支持，暂无法填写服务信息。
         </p>
         <ProductFormInputs
           v-if="schema"

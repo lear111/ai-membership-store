@@ -59,10 +59,10 @@ describe('purchase form validation', () => {
     ])
   })
 
-  it('uses the shared credential detector without reflecting answers', () => {
+  it('treats credential-like answers as ordinary text without reflecting them', () => {
     expect(
       purchaseErrors(schema, { handle: 'API key: fictional-only' }),
-    ).toEqual(['账号标识 · 不得填写认证凭证'])
+    ).toEqual([])
     expect(
       purchaseErrors(schema, { handle: 'public-user', injected: 'x' }),
     ).toEqual(['表单包含未知字段'])

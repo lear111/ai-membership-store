@@ -7,7 +7,6 @@ import {
   formDataSizeMessage,
   textareaLengthMessage,
 } from '../../../../backend/src/contracts/form-limits'
-import { hasCredentialValues } from '../../../../backend/src/contracts/credential-fields'
 
 const invalid = {
   text: '请输入不超过 500 个字符的文本',
@@ -30,7 +29,6 @@ export function purchaseErrors(schema: ProductFormSchema, values: FormData) {
       value === undefined ||
       (typeof value === 'string' && !value.trim()) ||
       (Array.isArray(value) && !value.length)
-    if (hasCredentialValues(value)) return [field.label + ' · 不得填写认证凭证']
     if (!invalidIds.has(field.id)) return []
     return [
       field.label +

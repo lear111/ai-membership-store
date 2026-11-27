@@ -594,7 +594,7 @@ test('server pagination and independent product/kind filters keep dense tables i
   })
 })
 
-test('credential-collecting catalog forms are blocked before entering data or submitting an order', async ({
+test('catalog forms labeled with credential words stay ordinary inputs', async ({
   page,
   context,
 }) => {
@@ -622,14 +622,13 @@ test('credential-collecting catalog forms are blocked before entering data or su
   await page
     .getByRole('option', { name: new RegExp(data.product.name) })
     .click()
-  await expect(form.getByRole('alert')).toContainText('认证凭证字段')
-  await expect(
-    form.getByRole('textbox', { name: '服务信息 验证码' }),
-  ).toHaveCount(0)
+  const input = form.getByRole('textbox', { name: '服务信息 验证码' })
+  await expect(input).toBeVisible()
+  await input.fill('fixture-code')
   await form.getByRole('button', { name: '创建订单' }).click()
-  expect(await db.order.count({ where: { productId: data.product.id } })).toBe(
-    0,
-  )
+  await expect
+    .poll(() => db.order.count({ where: { productId: data.product.id } }))
+    .toBe(1)
 })
 
 test('refund entry requires an explicit rollback offset and persists each selected instant', async ({

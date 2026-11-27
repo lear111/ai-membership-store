@@ -281,7 +281,6 @@ async function save() {
                   : '已确认服务实际履约完成'
           }}</ElCheckbox
         >
-        <p class="muted">请勿在备注或说明中填写密码、验证码或认证凭证。</p>
       </ElForm>
     </fieldset>
     <template #footer

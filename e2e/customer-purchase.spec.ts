@@ -238,7 +238,6 @@ test('signed-in buyer sees eight empty inputs and checks values locally', async 
   await input(page, '数量').fill('9007199254740992')
   await check(page).click()
   const alert = page.getByRole('alert')
-  await expect(alert).toContainText('账号标识 · 不得填写认证凭证')
   await expect(alert).toContainText('联系邮箱 · 请输入有效的邮箱地址')
   await expect(alert).toContainText('数量 · 请输入有效范围内的数字')
   await expect(alert).not.toContainText('fictional-input-only')
