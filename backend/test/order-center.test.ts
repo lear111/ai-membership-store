@@ -2,28 +2,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { orderEventDto } from '../src/modules/orders/events.ts'
 import { updateInternalNote } from '../src/modules/orders/center-schemas.ts'
-import { hasCredentialFields } from '../src/contracts/credential-fields.ts'
-import { productFormSchema } from '../src/contracts/product-form.ts'
 
-test('shared ordinary-form policy rejects credential fields before browser input while allowing account identifiers', () => {
-  for (const [label, expected] of [
-    ['账号', false],
-    ['联系邮箱', false],
-    ['密码', true],
-    ['验证码', true],
-    ['session_cookie', true],
-    ['API Key', true],
-  ] as const)
-    assert.equal(
-      hasCredentialFields(
-        productFormSchema.parse({
-          version: 1,
-          fields: [{ id: 'account', type: 'text', label, required: true }],
-        }),
-      ),
-      expected,
-    )
-})
 test('internal note is a required strict key with bounded normalized text and version', () => {
   assert.deepEqual(
     updateInternalNote.parse({ expectedVersion: 1, internalNote: '  ' }),

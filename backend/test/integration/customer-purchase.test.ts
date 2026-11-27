@@ -190,16 +190,17 @@ test('missing, unlisted and archived purchases have identical 404 responses', as
   }
 })
 
-test('credential fields and malformed historical forms return a sanitized 409', async () => {
-  for (const slug of ['purchase-credential', 'purchase-malformed']) {
-    const result = await read(slug)
-    assert.equal(result.status, 409)
-    const { requestId, ...error } = result.body.error
-    assert.equal(typeof requestId, 'string')
-    assert.deepEqual(error, {
-      code: 'PRODUCT_FORM_UNAVAILABLE',
-      message: '此商品的服务表单暂不可用',
-    })
-    assert.deepEqual(Object.keys(result.body), ['error'])
-  }
+test('credential-labeled fields stay purchasable while malformed historical forms return a sanitized 409', async () => {
+  const purchasable = await read('purchase-credential')
+  assert.equal(purchasable.status, 200)
+  assert.equal(purchasable.body.formSchema.fields[0].label, '禁止展示的配置')
+  const result = await read('purchase-malformed')
+  assert.equal(result.status, 409)
+  const { requestId, ...error } = result.body.error
+  assert.equal(typeof requestId, 'string')
+  assert.deepEqual(error, {
+    code: 'PRODUCT_FORM_UNAVAILABLE',
+    message: '此商品的服务表单暂不可用',
+  })
+  assert.deepEqual(Object.keys(result.body), ['error'])
 })

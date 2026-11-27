@@ -547,17 +547,20 @@ test('both actors enforce all dynamic field types, required values, options and 
   }
 })
 
-test('credential fields and recognizable credential payloads are rejected without persistence', async () => {
+test('credential-like payloads are persisted as ordinary order data for both roles', async () => {
   const p = await product()
   for (const value of [
     'password=never-store-this',
     'Bearer synthetic-access-token',
     '-----BEGIN PRIVATE KEY-----',
-  ])
-    await rejected(
-      () => request('customer', { ...body(p), formData: { account: value } }),
-      400,
-    )
+  ]) {
+    const result = await request('customer', {
+      ...body(p),
+      formData: { account: value },
+    })
+    assert.equal(result.status, 201, JSON.stringify(result.body))
+    assert.deepEqual(result.body.order.formData, { account: value })
+  }
   const secret = await product({
     formSchema: {
       version: 1,
@@ -571,15 +574,16 @@ test('credential fields and recognizable credential payloads are rejected withou
       ],
     },
   })
-  for (const role of ['customer', 'admin'] as const)
-    await rejected(
-      () =>
-        request(role, {
-          ...(role === 'admin' ? adminBody(secret) : body(secret)),
-          formData: { accessToken: 'never-store' },
-        }),
-      400,
-    )
+  for (const role of ['customer', 'admin'] as const) {
+    const result = await request(role, {
+      ...(role === 'admin' ? adminBody(secret) : body(secret)),
+      formData: { accessToken: 'stored-as-is' },
+    })
+    assert.equal(result.status, 201, JSON.stringify(result.body))
+    assert.deepEqual(result.body.order.formData, {
+      accessToken: 'stored-as-is',
+    })
+  }
 })
 
 const customerKeys = [
@@ -1261,10 +1265,6 @@ test('customer and admin can submit and replay 64 KiB forms without losing froze
     for (const [invalid, message] of [
       [{ ...formData, extra: formData.extra + 'x' }, /填写信息不能超过 64 KiB/],
       [{ note: formData.note + 'x' }, /10,000 个字符/],
-      [
-        { note: 'A'.repeat(9_950) + '\npassword=synthetic-only' },
-        /不得包含认证或付款凭证/,
-      ],
     ] as const) {
       const before = await db.order.count({ where: { productId: p.id } })
       const rejected = await request(actor, { ...input, formData: invalid })

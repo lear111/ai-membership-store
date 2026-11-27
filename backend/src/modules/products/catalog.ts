@@ -2,7 +2,6 @@ import { z } from 'zod'
 import type { Prisma, PrismaClient } from '../../generated/prisma/client.ts'
 import { ApiError } from '../../http/errors.ts'
 import { publicCoverUrl } from './cover-image.ts'
-import { hasCredentialFields } from '../../contracts/credential-fields.ts'
 import {
   productFormSchema,
   projectCustomerForm,
@@ -51,7 +50,7 @@ const missing = () => new ApiError(404, 'NOT_FOUND', '商品不存在')
 
 function purchaseForm(input: unknown) {
   const schema = productFormSchema.safeParse(input)
-  if (!schema.success || hasCredentialFields(schema.data))
+  if (!schema.success)
     throw new ApiError(
       409,
       'PRODUCT_FORM_UNAVAILABLE',

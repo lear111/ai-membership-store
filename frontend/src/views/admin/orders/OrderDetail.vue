@@ -11,7 +11,6 @@ import {
   type Evidence,
   type OrderEvent,
 } from '../../../api/orders'
-import { hasCredentialFields } from '../../../../../backend/src/contracts/credential-fields'
 import { productFormSchema } from '../../../../../backend/src/contracts/product-form'
 import ProductFormInputs from '../../../components/ProductFormInputs.vue'
 import OrderNumber from '../../../components/OrderNumber.vue'
@@ -50,9 +49,7 @@ const action = ref<Action>(),
   editing = ref(false)
 const schema = computed(() => {
   const parsed = productFormSchema.safeParse(order.value?.formSchemaSnapshot)
-  return parsed.success && !hasCredentialFields(parsed.data)
-    ? parsed.data
-    : null
+  return parsed.success ? parsed.data : null
 })
 const complete = computed(
   () =>
@@ -298,7 +295,7 @@ onMounted(load)
             disabled
         /></ElForm>
         <p v-else class="muted">
-          历史冻结表单未配置、格式不受支持或含认证凭证字段，服务信息不展示。
+          历史冻结表单未配置或格式不受支持，服务信息不展示。
         </p>
       </section>
       <section class="panel">

@@ -172,7 +172,7 @@ test('ADMIN settings normalize newlines, enforce boundaries, save and clear with
   )
 })
 
-test('customer projection suppresses unsafe frozen forms and legacy values without changing administrator snapshots', async () => {
+test('customer projection exposes frozen forms while suppressing undeclared legacy values without changing administrator snapshots', async () => {
   const product = await db.product.create({
     data: {
       slug: randomUUID(),
@@ -183,21 +183,34 @@ test('customer projection suppresses unsafe frozen forms and legacy values witho
     },
   })
   const cases = [
-    { id: 'password', label: '密码', value: 'fictional legacy credential' },
+    {
+      id: 'password',
+      label: '密码',
+      value: 'fictional legacy credential',
+      exposed: true,
+    },
     {
       id: 'account',
       label: '账号',
       value: 'password: fictional tagged credential',
+      exposed: true,
     },
-    { id: 'account', label: '账号', value: 'safe account', unexpected: true },
+    {
+      id: 'account',
+      label: '账号',
+      value: 'safe account',
+      unexpected: true,
+      exposed: false,
+    },
     {
       id: 'account',
       label: '账号',
       value: 'safe account',
       defaultValue: 'Bearer synthetic-private-default',
+      exposed: true,
     },
   ]
-  for (const { id, label, value, unexpected, defaultValue } of cases) {
+  for (const { id, label, value, unexpected, defaultValue, exposed } of cases) {
     const record = await db.order.create({
       data: {
         orderNo: 'T21-' + randomUUID().replaceAll('-', ''),
@@ -234,9 +247,15 @@ test('customer projection suppresses unsafe frozen forms and legacy values witho
     const path = '/customer/orders/' + record.id
     const { status, body } = await call(path, customer)
     assert.equal(status, 200)
-    assert.equal(body.order.formSchemaSnapshot, null)
-    assert.equal(body.order.formData, null)
-    assert.equal(body.order.targetIdentifier, null)
+    if (exposed) {
+      assert.equal(body.order.formSchemaSnapshot.fields[0].label, label)
+      assert.deepEqual(body.order.formData, record.formData)
+      assert.equal(body.order.targetIdentifier, value)
+    } else {
+      assert.equal(body.order.formSchemaSnapshot, null)
+      assert.equal(body.order.formData, null)
+      assert.equal(body.order.targetIdentifier, null)
+    }
     assert(!('internalNote' in body.order))
     assert(!('creator' in body.order))
     const list = await call(
@@ -246,7 +265,7 @@ test('customer projection suppresses unsafe frozen forms and legacy values witho
     assert.equal(list.body.total, 1)
     assert.deepEqual(
       list.body.items.map((item: { formData: unknown }) => item.formData),
-      [null],
+      [exposed ? record.formData : null],
     )
     const raw = await call('/admin/orders/' + record.id, admin)
     assert.deepEqual(raw.body.order.formData, record.formData)

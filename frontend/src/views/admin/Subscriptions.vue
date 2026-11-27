@@ -693,7 +693,7 @@ onMounted(async () => {
           <template v-if="mode !== 'renew'"
             ><h3>服务信息</h3>
             <p class="muted">
-              只填写必要的非敏感信息，禁止填写密码、验证码、令牌或支付凭据。
+              按商品表单填写服务信息。
             </p>
             <ProductFormInputs
               v-if="schema"

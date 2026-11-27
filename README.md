@@ -61,7 +61,7 @@ This is the product scope, not a completion checklist. Use the [status index](do
 - Supplier API integration. The supplier currently does not have an API; the first version uses email plus manual operations.
 - Automatic recurring charges.
 - Automatic account login or membership activation on third-party services.
-- Collecting customer passwords, one-time passwords, 2FA codes, recovery codes, session cookies, or other authentication secrets through ordinary forms or email.
+- Automating third-party logins, storing customer credentials in a vault, or emailing authentication secrets on the platform's behalf.
 - Multi-supplier routing, affiliate distribution, coupons, wallet balances, and complex accounting.
 
 ## Proposed technical baseline

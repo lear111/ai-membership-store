@@ -1,10 +1,5 @@
 import type { Prisma } from '../../generated/prisma/client.ts'
 import {
-  hasCredentialFields,
-  hasCredentialText,
-  hasCredentialValues,
-} from '../../contracts/credential-fields.ts'
-import {
   productFormSchema,
   projectCustomerForm,
 } from '../../contracts/product-form.ts'
@@ -127,25 +122,18 @@ function orderDto(order: CustomerOrder, now: Date) {
 export function customerOrderDto(order: CustomerOrder, now = new Date()) {
   const dto = orderDto(order, now)
   const schema = productFormSchema.safeParse(dto.formSchemaSnapshot)
-  // Suppress unsafe historical forms without exposing their values or changing the DTO allowlist.
+  // Suppress historical forms that cannot be parsed or whose stored values no longer match.
   const unsafe =
-    (dto.formSchemaSnapshot !== null &&
-      (!schema.success || hasCredentialFields(schema.data))) ||
+    (dto.formSchemaSnapshot !== null && !schema.success) ||
     (dto.formData !== null &&
       (!schema.success ||
-        !formDataSchema(schema.data).safeParse(dto.formData).success)) ||
-    hasCredentialValues(dto.formSchemaSnapshot) ||
-    hasCredentialValues(dto.formData)
+        !formDataSchema(schema.data).safeParse(dto.formData).success))
   return {
     ...dto,
     formSchemaSnapshot:
       !unsafe && schema.success ? projectCustomerForm(schema.data) : null,
     formData: unsafe ? null : dto.formData,
-    targetIdentifier:
-      unsafe ||
-      (dto.targetIdentifier && hasCredentialText(dto.targetIdentifier))
-        ? null
-        : dto.targetIdentifier,
+    targetIdentifier: unsafe ? null : dto.targetIdentifier,
   }
 }
 

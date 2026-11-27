@@ -15,7 +15,6 @@ import ProductFormInputs from '../../components/ProductFormInputs.vue'
 import CustomerWechatPayment from './CustomerWechatPayment.vue'
 import { parseFormData } from '../../../../backend/src/contracts/form-data'
 import { formLimitErrorMessage } from '../../../../backend/src/contracts/form-limits'
-import { hasCredentialText } from '../../../../backend/src/contracts/credential-fields'
 import { formValueLabel, money } from '../../stores/format'
 import {
   businessDate,
@@ -114,12 +113,6 @@ async function save() {
           formLimitErrorMessage(cause) ?? '请核对服务信息并填写所有必填项。'
         return
       }
-      if (
-        Object.values(formData)
-          .flat()
-          .some((v) => typeof v === 'string' && hasCredentialText(v))
-      )
-        throw new Error('请勿在订单中填写密码、验证码或认证凭证。')
       await request.send(customerOrderPath(current.id), 'PATCH', {
         expectedVersion: current.version,
         formData,
@@ -380,7 +373,7 @@ onMounted(load)
           :disabled="busy || uncertain"
           @submit.prevent="save"
         >
-          <p>修改此订单的服务信息。请勿填写密码、验证码或认证凭证。</p>
+          <p>修改此订单的服务信息。</p>
           <ProductFormInputs
             v-model="draft"
             :schema="snapshot.schema"

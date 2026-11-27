@@ -47,9 +47,8 @@ Use the status index for what is implemented and the linked task-specific contra
 
 - Never commit real API keys, SMTP passwords, access tokens, private keys, customer data, supplier secrets, or production configuration.
 - Provide .env.example with placeholders only. Ensure .env and local secret files are ignored by Git.
-- Never log passwords, one-time passwords, 2FA codes, recovery codes, payment credentials, or full sensitive form values.
-- The MVP must not collect account passwords, one-time passwords, 2FA codes, recovery codes, session cookies, or other authentication secrets in ordinary order forms or email.
-- Product-specific forms may collect only necessary, non-sensitive identifiers and contact details. If the supplier claims a secret is required, stop and request a separate security and authorization design; do not quietly add a password field.
+- Never log passwords, verification codes, recovery codes, payment credentials, or full sensitive form values; never include them in audit snapshots.
+- Product-specific forms may collect whatever fields the merchant needs to deliver the service, including fields the supplier labels as passwords, verification codes, tokens or API keys. Form answers are stored as plain text in order data: never put unrelated secrets in them, and never put real values in repository files, examples, seeds or documentation.
 - Do not automate login to third-party AI services or bypass their access controls.
 - Use role-based access control for administrator functions.
 - Verify ownership before showing an order or subscription to a customer.

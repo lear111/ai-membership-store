@@ -75,7 +75,7 @@ test('required idempotency key follows existing syntax without trimming or stori
   assert.equal(creationKey('a.b:c-d_1'), 'a.b:c-d_1')
 })
 
-test('order forms reuse canonical validation and reject explicit credential fields/values', () => {
+test('order forms reuse canonical validation and keep credential-like text as ordinary answers', () => {
   const schema = {
     version: 1,
     fields: [{ id: 'account', type: 'text', label: '账号', required: true }],
@@ -88,14 +88,17 @@ test('order forms reuse canonical validation and reject explicit credential fiel
     { account: '' },
     { account: 12 },
     { account: 'ok', extra: 'unknown' },
-    { account: 'password=secret' },
   ])
     assert.throws(() => creationForm(schema, input))
+  assert.deepEqual(creationForm(schema, { account: 'password=secret' }), {
+    account: 'password=secret',
+  })
   for (const label of ['Password', 'access_token', '验证码', '恢复码'])
-    assert.throws(() =>
+    assert.deepEqual(
       creationForm(
         { ...schema, fields: [{ ...schema.fields[0], label }] },
-        { account: 'never persisted' },
+        { account: 'persisted as-is' },
       ),
+      { account: 'persisted as-is' },
     )
 })

@@ -27,7 +27,7 @@ watch(
   <div class="form-preview" data-testid="form-preview">
     <h3>表单预览</h3>
     <p class="muted">
-      仅预览配置，试填内容不会保存或提交。请勿填写密码、验证码或其他敏感信息。
+      仅预览配置，试填内容不会保存或提交。
     </p>
     <p v-if="!valid.success" class="muted">请先修正字段配置后预览。</p>
     <template v-else>

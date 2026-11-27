@@ -2,7 +2,6 @@ import { z } from 'zod'
 import type { PrismaClient } from '../../generated/prisma/client.ts'
 import { transaction } from '../../db/transaction.ts'
 import { ApiError } from '../../http/errors.ts'
-import { hasCredentialText } from '../../contracts/credential-fields.ts'
 
 const adminSettingsSelect = {
   id: true,
@@ -39,12 +38,7 @@ export const editSettings = z
     paymentInstructions: z
       .string()
       .transform((value) => value.replace(/\r\n?/g, '\n'))
-      .pipe(
-        z
-          .string()
-          .max(4000)
-          .refine((value) => !hasCredentialText(value)),
-      )
+      .pipe(z.string().max(4000))
       .optional(),
   })
   .refine((value) => Object.keys(value).length > 0)
@@ -70,9 +64,7 @@ export function settingsService(database: PrismaClient) {
       return {
         storeName: settings.storeName,
         businessTimezone: zone.data,
-        paymentInstructions: hasCredentialText(settings.paymentInstructions)
-          ? ''
-          : settings.paymentInstructions,
+        paymentInstructions: settings.paymentInstructions,
       }
     },
     async get() {
